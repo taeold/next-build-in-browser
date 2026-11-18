@@ -1,6 +1,7 @@
 // Runs the real `next build --wasi --experimental-build-mode compile` in this worker: Next's own JS on the small
 // runtime in node/runtime.js, Turbopack + SWC from the wasm binding instantiated here.
-import { createFsClient, portsForChild } from "./fs-client.js";
+import { createFsClient } from "./fs-client.js";
+import { createThreadHost } from "./threads.js";
 import { createBinding } from "./binding.js";
 import { createRuntime } from "./node/runtime.js";
 import { getDefaultContext } from "/pkg/emnapi-runtime.mjs";
@@ -36,6 +37,7 @@ self.onmessage = async ({ data }) => {
     while ((i = stdoutBuf.indexOf("\n")) >= 0) { post("out", stdoutBuf.slice(0, i).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")); stdoutBuf = stdoutBuf.slice(i + 1); }
   };
   const redirects = { lightningcss: "lightningcss-wasm", "@tailwindcss/oxide": "/polyfills/node_modules/@vv/tailwind-oxide-js/index.js" };
+  const spawnWorker = createThreadHost({ fsClient, setup: { cwd: data.appDir, polyfills: data.polyfills, redirects }, write });
   const rt = createRuntime({
     fs: fsClient, cwd: data.appDir, polyfills: data.polyfills, write,
     // Next hands loader workers the binding's package name as bindingPath; give them the instance already running.
@@ -44,12 +46,7 @@ self.onmessage = async ({ data }) => {
     redirects,
     // worker_threads get real threads (node-worker.js), except Turbopack's loader workers: they share the binding
     // running on this thread.
-    spawnWorker: (init) => {
-      const thread = new Worker(new URL("./node-worker.js", import.meta.url), { type: "module", name: "node-worker" });
-      const [fsPort, regPort] = portsForChild(fsClient);
-      thread.postMessage({ nodeWorker: { ...init, fsPort, regPort, cwd: data.appDir, polyfills: data.polyfills, redirects } }, [fsPort, regPort]);
-      return thread;
-    },
+    spawnWorker,
     inRealmWorker: (_filename, options) => options?.workerData?.bindingPath === "@next/swc-wasm-wasi",
     // require() of an ES module (Node 22+), compiled to CommonJS by the SWC already in the binding.
     transformEsm: (source, filename) => exports.transformSync(source, false, globalThis.Buffer.from(JSON.stringify({

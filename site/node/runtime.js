@@ -18,8 +18,8 @@ class ProcessExit extends Error { constructor(code) { super(`process.exit(${code
 // `transformEsm(source, filename)` compiles an ES module to CommonJS, so require() of ESM works as in Node 22+.
 import { WASI as WasmUtilWASI } from "/wasm-util.js";
 
-// `spawnWorker(init)` starts a real thread (a Web Worker running node-worker.js) for worker_threads.Worker;
-// `inRealmWorker(filename, options)` picks the workers that run on this thread instead.
+// `spawnWorker(init)` starts a real thread (a Web Worker running node-worker.js) for worker_threads.Worker and returns
+// the MessagePort linked to it; `inRealmWorker(filename, options)` picks the workers that run on this thread instead.
 export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worker = null, aliases = {}, redirects = {}, transformEsm = null, spawnWorker = null, inRealmWorker = () => true }) {
   const builtins = new Map();
   const factories = {};
@@ -254,9 +254,21 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     throw notFound(request, parent);
   }
 
+  // An ES module with no imports of its own (emnapi's bundles, say) loads natively, so it needs no compiler.
+  // Cached per file, so stateful modules load once.
+  const nativeModules = new Map();
+  const selfContained = (src) => !/^[ \t]*(import[ \t]*[\w{*"']|export[ \t]*(\*|\{[^}]*\})[ \t]*from\b)/m.test(src);
   async function dynamicImport(spec, fromFile) {
     if (isBuiltin(spec)) { const ex = loadBuiltin(spec); return { ...ex, default: ex }; }
     const filename = resolve(spec, dirname(fromFile), null);
+    if (isEsmFile(filename) && !Module._cache[filename]) {
+      if (!nativeModules.has(filename)) {
+        const src = readText(filename);
+        nativeModules.set(filename, selfContained(src) ? import(URL.createObjectURL(new Blob([src], { type: "text/javascript" }))) : null);
+      }
+      const native = nativeModules.get(filename);
+      if (native) return native;
+    }
     const ex = Module._load(filename, null);
     await Module._cache[filename]?.evaluated;
     return ex && ex.__esModule ? { ...ex, default: ex.default ?? ex } : { ...(typeof ex === "object" ? ex : {}), default: ex };
@@ -479,19 +491,19 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
         hold(this);
         thread.onmessage = (e) => {
           const d = e.data;
-          if (d && d.__nodeStdio) return write(d.__nodeStdio[0], d.__nodeStdio[1]);
-          if (d && d.__nodeExit !== undefined) { this._thread = null; thread.terminate(); release(this); return this.emit("exit", d.__nodeExit); }
+          if (d && d.__nodeError) { this.emit("error", Object.assign(new Error(d.__nodeError.message), d.__nodeError)); return; }
+          if (d && d.__nodeExit !== undefined) { this._close(); return this.emit("exit", d.__nodeExit); }
           this.emit("message", d);
         };
-        thread.onerror = (e) => { e.preventDefault(); this.emit("error", e.error || new Error(e.message)); };
         setTimeout(() => this.emit("online"), 0);
       }
+      _close() { if (this._thread) { this._thread.close(); this._thread = null; } release(this); }
       postMessage(message, transfer) { if (this._thread) this._thread.postMessage(message, transfer); }
       ref() { if (this._thread) hold(this); return this; }
       unref() { release(this); return this; }
       terminate() {
-        if (this._thread) { this._thread.terminate(); this._thread = null; }
-        release(this);
+        if (this._thread) this._thread.postMessage({ __nodeTerminate: true });
+        this._close();
         setTimeout(() => this.emit("exit", 1), 0);
         return Promise.resolve(1);
       }
