@@ -39,13 +39,16 @@ const mib = (n) => (n / 1048576).toFixed(0) + "mib";
 const again = ["build another app", () => { location.href = location.pathname; }];
 
 // ---------- boot ----------
+// The two big toolchain files come from jsDelivr, out of the repo's `assets` branch at a pinned commit
+// (scripts/publish-assets.sh), so the page's own host serves only small files. A local server uses its copies.
+const ASSETS = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? "/assets" : "https://cdn.jsdelivr.net/gh/taeold/next-build-in-browser@fd287ee7db0e399fd0d4db23995fec0dd2980dc7";
 const toolchain = print("toolchain: loading", "faint");
 const fsWorker = new Worker("/fs-worker.js", { type: "module", name: "fs" });
 const fsReady = new Promise((resolve) => fsWorker.addEventListener("message", (e) => {
   if (e.data.type === "progress") toolchain.textContent = `toolchain: downloading ${mib(e.data.seen)}${e.data.total ? " / " + mib(e.data.total) : ""}`;
   if (e.data.type === "ready") resolve(e.data);
 }));
-fsWorker.postMessage({ type: "init", packs: ["/assets/base.pack.br"], extraDirs: ["/app", "/tmp", "/home/user"] });
+fsWorker.postMessage({ type: "init", packs: [`${ASSETS}/base.pack.br`], extraDirs: ["/app", "/tmp", "/home/user"] });
 
 const root = new MessageChannel();
 fsWorker.postMessage({ type: "registrar", port: root.port2 }, [root.port2]);
@@ -55,7 +58,7 @@ root.port1.postMessage({ type: "registrar", port: reg.port2 }, [reg.port2]);
 
 const host = new Worker("/next-host-worker.js", { type: "module", name: "next-build" });
 const bindingReady = new Promise((resolve) => host.addEventListener("message", (e) => e.data.type === "binding-ready" && resolve(e.data)));
-host.postMessage({ type: "start", fsPort: rpc.port1, regPort: reg.port1, wasmUrl: "/assets/next-swc.wasm.br", parallelism: 2 }, [rpc.port1, reg.port1]);
+host.postMessage({ type: "start", fsPort: rpc.port1, regPort: reg.port1, wasmUrl: `${ASSETS}/next-swc.wasm.br`, parallelism: 2 }, [rpc.port1, reg.port1]);
 
 // The app picker: the sample, then the gallery of Next.js examples (scripts/snapshot-examples.mjs).
 const picker = document.createElement("select");

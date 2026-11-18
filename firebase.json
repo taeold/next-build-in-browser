@@ -1,7 +1,7 @@
 {
   "hosting": {
     "public": "site",
-    "ignore": ["**/.*"],
+    "ignore": ["**/.*", "assets/*.br"],
     "headers": [
       {
         "source": "**",

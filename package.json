@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "assets": "scripts/build-assets.sh",
+    "publish-assets": "scripts/publish-assets.sh",
     "serve": "node scripts/serve.mjs",
     "verify": "node scripts/verify.mjs",
     "examples": "node scripts/snapshot-examples.mjs",
