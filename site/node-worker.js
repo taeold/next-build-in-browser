@@ -19,14 +19,12 @@ self.addEventListener("message", function init(e) {
   const rt = createRuntime({
     fs: createFsClient(d.fsPort, d.regPort), cwd: d.cwd, polyfills: d.polyfills, env: d.env, argv: d.argv, redirects: d.redirects,
     write: (fd, text) => service.postMessage({ stdio: [fd, text] }),
-    // This thread has no compiler; its creator compiled the ES modules it loads (see compileThreadGraph).
-    transformEsm: (source, filename) => {
-      if (filename in d.transformed) return d.transformed[filename];
-      throw new Error(`cannot compile ES module ${filename} in a worker thread`);
-    },
-    spawnWorker: (init) => {
+    // This thread has no compiler. Its creator compiled the ES modules it could find ahead (compileThreadGraph); the
+    // rest the root compiles on request.
+    transformEsm: (source, filename) => (filename in d.transformed ? d.transformed[filename] : compileOnRoot(service, source, filename)),
+    spawnWorker: (init, transfer = []) => {
       const child = new MessageChannel();
-      service.postMessage({ spawn: init, link: child.port2 }, [child.port2]);
+      service.postMessage({ spawn: init, link: child.port2, transfer }, [child.port2, ...transfer]);
       return child.port1;
     },
     worker: { workerData: d.workerData, threadId: d.threadId, port: { postMessage: (m, t) => link.postMessage(m, t), addEventListener: (type, f) => { link.addEventListener(type, f); link.start(); } } },
@@ -39,3 +37,17 @@ self.addEventListener("message", function init(e) {
     else report(err);
   }
 });
+
+// Blocks until the root thread (threads.js) compiles `source`, like a synchronous require.
+function compileOnRoot(service, source, filename) {
+  for (let size = source.length * 4 + 65536; ;) {
+    const reply = new SharedArrayBuffer(8 + size), header = new Int32Array(reply, 0, 2);
+    service.postMessage({ compile: { source, filename }, reply });
+    Atomics.wait(header, 0, 0);
+    const length = header[1];
+    if (length > size) { size = length; continue; }
+    const text = new TextDecoder().decode(new Uint8Array(reply, 8, length).slice());
+    if (Atomics.load(header, 0) === 2) throw new Error(text);
+    return text;
+  }
+}

@@ -37,7 +37,9 @@ for (const app of apps) {
     const out = await text();
     const install = (out.match(/added \d+ packages[^\n]*/) || [""])[0];
     const done = (out.match(/done in [\d.]+s/) || [""])[0];
-    line = done ? `ok    ${done}  ${install}` : `FAIL  ${(out.match(/(Error|failed)[^\n]*/) || ["?"])[0].slice(0, 120)}`;
+    // A build that ends before writing anything (an early exit) still prints "done", with 0 files.
+    const empty = /done in [\d.]+s · \S+ 0 files/.test(out);
+    line = done && !empty ? `ok    ${done}  ${install}` : `FAIL  ${empty ? "build reported done with no output files" : (out.match(/(Error|failed)[^\n]*/) || ["?"])[0].slice(0, 120)}`;
     if (done && deploy) {
       await page.getByRole("button", { name: /^([→▲]\s*)?deploy$/ }).click();
       await page.waitForFunction(() => /deployed|deploy failed/.test(document.getElementById("screen").innerText), null, { timeout: 600000 });
@@ -45,7 +47,7 @@ for (const app of apps) {
       line += deployed ? `  ${deployed[1]}` : "  deploy FAILED";
       if (!deployed) failures++;
     }
-    if (!done) failures++;
+    if (!done || empty) failures++;
   } catch (e) {
     line = `FAIL  ${e.message.split("\n")[0]}`;
     failures++;

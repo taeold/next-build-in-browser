@@ -99,8 +99,11 @@ function rootAt(files) {
 // How to build each supported framework: the CLI to run (relative to the app), its arguments, and where output lands.
 const FRAMEWORKS = [
 // `output` says how the output deploys (deploy.js): "next" is a standalone server plus static files, "static" is files.
-  { name: "next", detect: (deps) => deps.next, bin: "node_modules/next/dist/bin/next", args: ["build", "--wasi", "--experimental-build-mode", "compile"], env: { NEXT_PRIVATE_STANDALONE: "1" }, outDir: ".next", output: "next" },
-  { name: "vite", detect: (deps) => deps.vite, bin: "node_modules/vite/bin/vite.js", args: ["build"], env: {}, outDir: "dist", output: "static" },
+// `exit` says how the CLI ends: "explicit" calls process.exit(); "idle" returns and ends once nothing holds the event
+// loop open. The runtime cannot see every pending native call (a binding's C thread-safe functions), so idle
+// detection is only used for CLIs that need it.
+  { name: "next", detect: (deps) => deps.next, bin: "node_modules/next/dist/bin/next", args: ["build", "--wasi", "--experimental-build-mode", "compile"], env: { NEXT_PRIVATE_STANDALONE: "1" }, outDir: ".next", output: "next", exit: "explicit" },
+  { name: "vite", detect: (deps) => deps.vite, bin: "node_modules/vite/bin/vite.js", args: ["build"], env: {}, outDir: "dist", output: "static", exit: "idle" },
 ];
 function checkApp(files) {
   const pkg = JSON.parse(new TextDecoder().decode(files.find(([p]) => p === "package.json")[1]));
@@ -159,7 +162,7 @@ async function build(files, label, title) {
     await npmInstall(files);
     await bindingReady;
     print(`<b>$ ${esc(framework.name)} ${esc(framework.args.join(" "))}</b>`);
-    host.postMessage({ type: "run", appDir: "/app", polyfills: "/polyfills/node_modules", parallelism: 2, bin: framework.bin, args: framework.args, env: framework.env, outDir: framework.outDir });
+    host.postMessage({ type: "run", appDir: "/app", polyfills: "/polyfills/node_modules", parallelism: 2, bin: framework.bin, args: framework.args, env: framework.env, outDir: framework.outDir, exitOnIdle: framework.exit === "idle" });
   } catch (e) {
     say(String(e.message || e), "bad");
     running(null);

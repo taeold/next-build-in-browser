@@ -9,8 +9,7 @@ const BUILTIN_NAMES = [
   "timers", "timers/promises", "tls", "tty", "url", "util", "util/types", "v8", "vm", "wasi", "worker_threads", "zlib",
 ];
 
-// `worker` makes this runtime an in-realm worker thread: same JS thread and globals, its own module cache.
-// `aliases` maps a require specifier straight to exports (e.g. the N-API binding the host already loaded).
+// `worker` ({ workerData, threadId, port }) makes this runtime a worker thread; `port` is its link to its parent.
 let nextThreadId = 0;
 // Shared by every runtime in this realm, so the host recognizes an exit thrown from any of them.
 class ProcessExit extends Error { constructor(code) { super(`process.exit(${code})`); this.code = code; } }
@@ -18,9 +17,9 @@ class ProcessExit extends Error { constructor(code) { super(`process.exit(${code
 // `transformEsm(source, filename)` compiles an ES module to CommonJS, so require() of ESM works as in Node 22+.
 import { WASI as WasmUtilWASI } from "/wasm-util.js";
 
-// `spawnWorker(init)` starts a real thread (a Web Worker running node-worker.js) for worker_threads.Worker and returns
-// the MessagePort linked to it; `inRealmWorker(filename, options)` picks the workers that run on this thread instead.
-export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worker = null, aliases = {}, redirects = {}, transformEsm = null, spawnWorker = null, inRealmWorker = () => true }) {
+// `spawnWorker(init, transfer)` starts a real thread (a Web Worker running node-worker.js) for worker_threads.Worker and
+// returns the MessagePort linked to it.
+export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worker = null, redirects = {}, transformEsm = null, spawnWorker = null }) {
   const builtins = new Map();
   const factories = {};
   // What would keep a Node process alive, shared by every runtime on this thread (they share globals): referenced
@@ -102,7 +101,6 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     }
     static _resolveFilename(request, parent) { return resolve(request, parent ? dirname(parent.filename || join(cwd, "x")) : cwd, parent); }
     static _load(request, parent) {
-      if (Object.prototype.hasOwnProperty.call(aliases, request)) return aliases[request];
       for (const [from, to] of Object.entries(redirects)) if (request === from || request.startsWith(from + "/")) { request = to + request.slice(from.length); break; }
       if (isBuiltin(request)) return loadBuiltin(request);
       const filename = Module._resolveFilename(request, parent, false);
@@ -447,7 +445,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       for (const [, , spec] of code.matchAll(/require\w*\(\s*(["'])([^"'\n]+)\1\s*\)/g)) {
         let request = spec;
         for (const [from, to] of Object.entries(redirects)) if (request === from || request.startsWith(from + "/")) { request = to + request.slice(from.length); break; }
-        if (isBuiltin(request) || Object.prototype.hasOwnProperty.call(aliases, request)) continue;
+        if (isBuiltin(request)) continue;
         try { const target = resolve(request, dirname(file), null); if (!isBuiltin(target)) todo.push(target); } catch {}
       }
     }
@@ -455,38 +453,23 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     return transformed;
   }
 
-  // A Worker is a real thread (spawnWorker) unless inRealmWorker says otherwise. Turbopack's loader workers talk to
-  // the binding only through async calls, so they run on this thread: a child runtime with its own module cache,
-  // sharing files and the binding. A real thread gets its own runtime; this thread compiles its entry if it is an
-  // ES module, since the compiler (SWC in the binding) lives here.
+  // A Worker is a real thread (spawnWorker) with its own runtime. This thread compiles the ES modules it will load
+  // (compileThreadGraph), since the compiler lives here.
   function makeWorkerThreads() {
     const EE = loadBuiltin("events");
     const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
     class Worker extends EE {
       constructor(file, opts = {}) {
         super();
+        if (!spawnWorker) throw new Error("worker_threads.Worker is not available here");
         this.threadId = ++nextThreadId;
         const filename = String(file).startsWith("file:") ? decodeURIComponent(new URL(String(file)).pathname) : String(file);
-        if (spawnWorker && !inRealmWorker(filename, opts)) { this._startThread(filename, opts); return; }
-        const child = createRuntime({
-          fs: fsc, cwd, polyfills, write, aliases, redirects, transformEsm, spawnWorker, inRealmWorker,
-          env: opts.env && opts.env !== SHARE_ENV ? { ...opts.env } : env,
-          argv: [argv[0], filename, ...(opts.argv || []).map(String)],
-          worker: { workerData: opts.workerData === undefined ? null : opts.workerData, threadId: this.threadId },
-        });
-        setTimeout(() => {
-          try { child.runWorker(filename); this.emit("online"); }
-          catch (e) { this.emit("error", e); this.emit("exit", 1); }
-        }, 0);
-      }
-      _startThread(filename, opts) {
-        const transformed = compileThreadGraph(filename);
         const thread = spawnWorker({
-          filename, transformed, threadId: this.threadId,
+          filename, transformed: compileThreadGraph(filename), threadId: this.threadId,
           env: opts.env && opts.env !== SHARE_ENV ? { ...opts.env } : { ...loadBuiltin("process").env },
           argv: [argv[0], filename, ...(opts.argv || []).map(String)],
           workerData: opts.workerData === undefined ? null : opts.workerData,
-        });
+        }, opts.transferList || []);
         this._thread = thread;
         hold(this);
         thread.onmessage = (e) => {
@@ -695,10 +678,21 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       };
       globalThis.clearImmediate = (h) => { if (h && q.delete(h._id)) release(h); };
     }
-    // Node's MessagePort has ref()/unref(); emnapi refs one while native async work is pending.
+    // Node's MessagePort is also an EventEmitter-style object: on('message', value => ...), plus ref()/unref()
+    // (emnapi refs one while native async work is pending).
     if (typeof MessagePort !== "undefined" && !("ref" in MessagePort.prototype)) {
-      MessagePort.prototype.ref = function () { hold(this); return this; };
-      MessagePort.prototype.unref = function () { release(this); return this; };
+      const proto = MessagePort.prototype, wrapped = new WeakMap();
+      proto.ref = function () { hold(this); return this; };
+      proto.unref = function () { release(this); return this; };
+      proto.on = proto.addListener = function (type, fn) {
+        const listener = type === "message" ? (e) => fn(e.data) : fn;
+        wrapped.set(fn, listener);
+        this.addEventListener(type, listener);
+        if (type === "message") this.start();
+        return this;
+      };
+      proto.once = function (type, fn) { const once = (v) => { this.off(type, once); fn(v); }; return this.on(type, once); };
+      proto.off = proto.removeListener = function (type, fn) { this.removeEventListener(type, wrapped.get(fn) || fn); return this; };
     }
   };
 
@@ -732,14 +726,6 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
         loop.listeners.add(check);
         check();
       });
-    },
-    // Workers reuse the globals the main runtime installed.
-    runWorker(file) {
-      const filename = resolve(file, cwd, null);
-      const m = new Module(filename);
-      Module._cache[filename] = m;
-      m.load(filename);
-      return m;
     },
   };
 }

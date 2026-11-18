@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO=taeold/next.js
-RELEASE=browser-20261118
+RELEASE=browser-20261118b
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SITE=$ROOT/site
 WORK=$(mktemp -d)

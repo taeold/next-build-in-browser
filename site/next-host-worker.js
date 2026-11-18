@@ -37,24 +37,21 @@ self.onmessage = async ({ data }) => {
     while ((i = stdoutBuf.indexOf("\n")) >= 0) { post("out", stdoutBuf.slice(0, i).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")); stdoutBuf = stdoutBuf.slice(i + 1); }
   };
   const redirects = { lightningcss: "lightningcss-wasm", "@tailwindcss/oxide": "/polyfills/node_modules/@vv/tailwind-oxide-js/index.js" };
-  const spawnWorker = createThreadHost({ fsClient, setup: { cwd: data.appDir, polyfills: data.polyfills, redirects }, write });
+  // require() of an ES module (Node 22+), compiled to CommonJS by the SWC already in the binding.
+  // "swc" interop honors __esModule, so a default import of another compiled ES module gets its default export.
+  const transformEsm = (source, filename) => exports.transformSync(source, false, globalThis.Buffer.from(JSON.stringify({
+    filename, isModule: true, sourceMaps: false,
+    jsc: { parser: { syntax: "ecmascript", importAttributes: true }, target: "es2022" },
+    module: { type: "commonjs", importInterop: "swc" },
+  }))).code;
+  const spawnWorker = createThreadHost({ fsClient, setup: { cwd: data.appDir, polyfills: data.polyfills, redirects }, write, transformEsm });
   const rt = createRuntime({
     fs: fsClient, cwd: data.appDir, polyfills: data.polyfills, write,
-    // Next hands loader workers the binding's package name as bindingPath; give them the instance already running.
-    aliases: { "@next/swc-wasm-wasi": exports },
     // Native packages Tailwind needs: lightningcss has an official wasm build; oxide gets a JS scanner (see the file).
     redirects,
-    // worker_threads get real threads (node-worker.js), except Turbopack's loader workers: they share the binding
-    // running on this thread.
+    // worker_threads get real threads (node-worker.js, created by threads.js).
     spawnWorker,
-    inRealmWorker: (_filename, options) => options?.workerData?.bindingPath === "@next/swc-wasm-wasi",
-    // require() of an ES module (Node 22+), compiled to CommonJS by the SWC already in the binding.
-    transformEsm: (source, filename) => exports.transformSync(source, false, globalThis.Buffer.from(JSON.stringify({
-      filename, isModule: true, sourceMaps: false,
-      jsc: { parser: { syntax: "ecmascript", importAttributes: true }, target: "es2022" },
-      // "swc" interop honors __esModule, so a default import of another compiled ES module gets its default export.
-      module: { type: "commonjs", importInterop: "swc" },
-    }))).code,
+    transformEsm,
     env: { HOME: "/home/user", PATH: "/usr/bin", NEXT_TELEMETRY_DISABLED: "1", TURBO_TASKS_AVAILABLE_PARALLELISM: String(data.parallelism), ...data.env },
     argv: ["/usr/bin/node", data.appDir + "/" + (data.bin || "node_modules/next/dist/bin/next"), ...data.args],
   });
@@ -108,7 +105,7 @@ self.onmessage = async ({ data }) => {
   try {
     rt.runMain(data.appDir + "/" + (data.bin || "node_modules/next/dist/bin/next"));
     // A CLI that returns without process.exit() ends, as in Node, when nothing holds the event loop open.
-    rt.whenIdle().then((code) => { rt.process.emit("exit", code); finish(code); });
+    if (data.exitOnIdle) rt.whenIdle().then((code) => { rt.process.emit("exit", code); finish(code); });
   } catch (e) {
     onFailure(e);
   }
