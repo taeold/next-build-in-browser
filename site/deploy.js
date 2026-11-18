@@ -63,8 +63,9 @@ async function api(path, { token, ...init } = {}) {
 }
 const sha1 = async (bytes) => [...new Uint8Array(await crypto.subtle.digest("SHA-1", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
-export async function deployPrebuilt(output, onProgress) {
-  onProgress("creating project");
+// out.line(text) prints a line; out.progress(text) updates the last line in place (the upload counter).
+export async function deployPrebuilt(output, out) {
+  out.line("creating project");
   const { token, projectId: project, claimUrl, expiresAt } = await api("/v1/anonymous/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 
   // Like the Vercel CLI: describe every file by hash, and upload only the ones Vercel says it doesn't have yet.
@@ -74,7 +75,6 @@ export async function deployPrebuilt(output, onProgress) {
     token, method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: project, project, target: "production", version: 2, files: files.map(({ bytes, ...f }) => f), projectSettings: { framework: null, sourceFilesOutsideRootDirectory: true } }),
   });
-  onProgress("deploying");
   let dep;
   try {
     dep = await create();
@@ -87,25 +87,29 @@ export async function deployPrebuilt(output, onProgress) {
     const worker = async () => {
       for (let f; (f = queue.shift()); ) {
         await api("/v2/files", { token, method: "POST", headers: { "Content-Type": "application/octet-stream", "x-vercel-digest": f.sha }, body: f.bytes });
-        onProgress(`uploading ${++done}/${total} files`);
+        out.progress(`uploading ${++done}/${total} files`);
       }
     };
     await Promise.all(Array.from({ length: 16 }, worker));
     dep = await create();
   }
+  // Stream Vercel's own log while it deploys; it says it used the uploaded artifacts instead of building.
+  let printed = 0;
+  const streamLog = async () => {
+    try {
+      const events = await api(`/v3/deployments/${dep.id}/events?builds=1&limit=-1`, { token });
+      const lines = (Array.isArray(events) ? events : []).map((e) => (e.payload && e.payload.text) || e.text || "").filter((t) => /deployment files|prebuilt build artifacts|Deploying outputs|Deployment completed/.test(t));
+      for (; printed < lines.length; printed++) out.line(`vercel | ${lines[printed]}`);
+    } catch {}
+  };
   while (!["READY", "ERROR", "CANCELED"].includes(dep.readyState)) {
-    onProgress("deploying");
-    await new Promise((r) => setTimeout(r, 2000));
+    await streamLog();
+    await new Promise((r) => setTimeout(r, 1000));
     dep = await api(`/v13/deployments/${dep.id}`, { token });
   }
+  await streamLog();
   if (dep.readyState !== "READY") throw new Error(`Deployment ended in state ${dep.readyState}`);
-  // Vercel's own log for the deployment, which says it used the uploaded artifacts instead of building.
-  let log = [];
-  try {
-    const events = await api(`/v3/deployments/${dep.id}/events?builds=1&limit=-1`, { token });
-    log = (Array.isArray(events) ? events : []).map((e) => (e.payload && e.payload.text) || e.text || "").filter((t) => /deployment files|prebuilt build artifacts|Deploying outputs|Deployment completed/.test(t));
-  } catch {}
   // The temporary *.tmp.now alias is public; *.vercel.app aliases of an anonymous deployment sit behind Vercel login.
   const alias = (dep.alias || []).find((a) => a.endsWith(".tmp.now")) || (dep.alias || []).find((a) => a.endsWith(".vercel.app")) || dep.alias?.[0];
-  return { url: "https://" + (alias || dep.url), deploymentUrl: "https://" + dep.url, inspectorUrl: dep.inspectorUrl, claimUrl, expiresAt, deploymentId: dep.id, log };
+  return { url: "https://" + (alias || dep.url), deploymentUrl: "https://" + dep.url, inspectorUrl: dep.inspectorUrl, claimUrl, expiresAt, deploymentId: dep.id };
 }

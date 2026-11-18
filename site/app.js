@@ -184,20 +184,18 @@ host.addEventListener("message", ({ data }) => {
 async function deploy() {
   running("deploy");
   actions([]);
-  const progress = print("", "faint");
+  let live = null;
+  const out = { line: (text) => { live = null; say(text, "faint"); }, progress: (text) => { (live ||= print("", "faint")).textContent = text; } };
   try {
     const proof = { builtInBrowser: true, buildId, buildSeconds: Number(buildSeconds.toFixed(1)), builtAt: new Date().toISOString(), command: "next build --wasi --experimental-build-mode compile", buildPage: location.origin, userAgent: navigator.userAgent };
-    const result = await deployPrebuilt(toBuildOutput(dotNext, app.files, proof), (msg) => { progress.textContent = msg; });
-    progress.remove();
+    const result = await deployPrebuilt(toBuildOutput(dotNext, app.files, proof), out);
     const minutes = Math.max(0, Math.round((result.expiresAt - Date.now()) / 60000));
-    for (const l of result.log) print(`<span class="faint">vercel | ${esc(l)}</span>`);
     print(`<span class="faint">proof</span> <a href="${result.url}/built-in-browser.json" target="_blank" rel="noopener">/built-in-browser.json</a> <span class="faint">→ build id ${esc(buildId)}</span>`);
     print(`<span class="faint">expires in ${minutes} min ·</span> <a href="${result.claimUrl}" target="_blank" rel="noopener">claim it</a> <span class="faint">(private link)</span>`);
     print(`<span class="ok">deployed</span> <a href="${result.url}" target="_blank" rel="noopener">${esc(result.url)}</a>`);
     actions([["download .next", download], again]);
     running(null);
   } catch (e) {
-    progress.remove();
     say(`deploy failed: ${e.message || e}`, "bad");
     running(null);
     actions([["deploy", deploy, "▲"], ["download .next", download], again]);
