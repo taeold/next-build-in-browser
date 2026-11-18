@@ -49,7 +49,7 @@ WASI=$WORK/app/node_modules/@next/swc-wasm-wasi
 mkdir -p "$SITE/assets" "$SITE/pkg"
 rm -f "$SITE"/assets/*.gz
 node "$ROOT/scripts/compress.mjs" "$WASI/next-swc.wasm32-wasi.wasm" "$SITE/assets/next-swc.wasm.br"
-cp "$WASI"/emnapi-core.mjs "$WASI"/emnapi-runtime.mjs "$WASI"/wasi-threads.mjs "$WASI"/LICENSE.emnapi "$SITE/pkg/"
+cp "$WASI"/emnapi-core.mjs "$WASI"/emnapi-runtime.mjs "$WASI"/LICENSE.emnapi "$SITE/pkg/"
 rm -rf "$WASI" "$WORK/app/node_modules/.package-lock.json"
 
 echo "== Node.js polyfills"

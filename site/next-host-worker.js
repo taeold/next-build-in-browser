@@ -15,20 +15,19 @@ let started;
 self.onmessage = async ({ data }) => {
   if (data.type === "start") {
     const fsClient = createFsClient(data.fsPort, data.regPort);
-    const life = new Int32Array(new SharedArrayBuffer(32));
-    started = createBinding({ fsClient, wasmUrl: data.wasmUrl, parallelism: data.parallelism, life }).then(({ exports, pool }) => {
+    started = createBinding({ fsClient, wasmUrl: data.wasmUrl, parallelism: data.parallelism }).then(({ exports, threadCount }) => {
       // Errors thrown in callbacks that wasm calls into would otherwise be swallowed by emnapi.
       const register = exports.registerWorkerScheduler;
       const loud = (name, fn) => (...a) => { try { return fn(...a); } catch (e) { console.error(`${name} failed:`, e && (e.stack || e)); throw e; } };
       if (register) exports.registerWorkerScheduler = (create, terminate) => register.call(exports, loud("loader worker create", create), loud("loader worker terminate", terminate));
       globalThis.__NEXT_WASI_NAPI_EXPORTS__ = exports;
-      self.postMessage({ type: "binding-ready", target: exports.getTargetTriple(), threads: pool.workers.length });
-      return { fsClient, pool, exports };
+      self.postMessage({ type: "binding-ready", target: exports.getTargetTriple(), threads: threadCount() });
+      return { fsClient, threadCount, exports };
     }, (e) => { self.postMessage({ type: "done", ok: false, code: -1, error: String(e && (e.stack || e)) }); throw e; });
     return;
   }
   if (data.type !== "run") return;
-  const { fsClient, pool, exports } = await started;
+  const { fsClient, threadCount, exports } = await started;
 
   let stdoutBuf = "";
   const write = (fd, s) => {
@@ -74,12 +73,11 @@ self.onmessage = async ({ data }) => {
       }
     };
     try { walk(data.appDir + "/.next"); } catch {}
-    log(`next exited with code ${code}; .next holds ${outputs.length} files; pool grew to ${pool.workers.length} threads`);
+    log(`next exited with code ${code}; .next holds ${outputs.length} files; ${threadCount()} wasm threads`);
     // Hand .next to the page for display and download.
     const blobs = outputs.map(([p, , link]) => (link ? new TextEncoder().encode(link) : fsClient.readFileBytes(p)));
     const files = outputs.map(([p, , link], i) => [p.slice(data.appDir.length + 1), blobs[i], link]);
     self.postMessage({ type: "dotnext", files }, blobs.map((b) => b.buffer));
-    pool.stop();
     self.postMessage({ type: "done", ok: code === 0, code, error: error && String(error.stack || error), buildSeconds: (performance.now() - tStart) / 1000, outputs });
   };
   const onFailure = (e) => {

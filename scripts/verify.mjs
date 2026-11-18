@@ -27,7 +27,9 @@ for (const app of apps) {
   let line;
   try {
     const example = app.startsWith("example:") && app.slice(8);
-    await page.goto(example ? `${url}?example=${encodeURIComponent(example)}` : url);
+    const target = new URL(url);
+    if (example) target.searchParams.set("example", example);
+    await page.goto(target.href);
     await page.waitForFunction(() => /toolchain: ready/.test(document.getElementById("screen").innerText), null, { timeout: 180000 });
     if (app === "sample") await page.getByRole("button", { name: /^(→\s*)?build$/ }).click();
     else if (!example) await page.setInputFiles("#folder", path.resolve(app));

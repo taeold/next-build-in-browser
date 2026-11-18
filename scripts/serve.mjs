@@ -5,7 +5,7 @@ import path from "node:path";
 
 const root = path.resolve(new URL("../site", import.meta.url).pathname);
 const port = Number(process.env.PORT || 8721);
-const types = { ".js": "text/javascript", ".mjs": "text/javascript", ".cjs": "text/javascript", ".html": "text/html", ".json": "application/json", ".woff2": "font/woff2" };
+const types = { ".js": "text/javascript", ".mjs": "text/javascript", ".cjs": "text/javascript", ".html": "text/html", ".json": "application/json", ".woff2": "font/woff2", ".wasm": "application/wasm" };
 
 http.createServer((req, res) => {
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
