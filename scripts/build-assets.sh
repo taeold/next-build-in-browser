@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO=taeold/next.js
-RELEASE=browser-20261118b
+RELEASE=browser-20261118c
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SITE=$ROOT/site
 WORK=$(mktemp -d)
@@ -44,13 +44,13 @@ cat > "$WORK/app/package.json" <<EOF
 EOF
 (cd "$WORK/app" && npm install --no-audit --no-fund --omit=optional --loglevel=error)
 
-echo "== wasm binding and emnapi"
+echo "== wasm binding"
 WASI=$WORK/app/node_modules/@next/swc-wasm-wasi
 mkdir -p "$SITE/assets" "$SITE/pkg"
 rm -f "$SITE"/assets/*.gz
 node "$ROOT/scripts/compress.mjs" "$WASI/next-swc.wasm32-wasi.wasm" "$SITE/assets/next-swc.wasm.br"
-cp "$WASI"/emnapi-core.mjs "$WASI"/emnapi-runtime.mjs "$WASI"/LICENSE.emnapi "$SITE/pkg/"
-rm -rf "$WASI" "$WORK/app/node_modules/.package-lock.json"
+# The package stays in the archive for Next.js's own loader; its wasm ships separately (fs-worker puts it back).
+rm -f "$WASI/next-swc.wasm32-wasi.wasm" "$WORK/app/node_modules/.package-lock.json"
 
 echo "== Node.js polyfills"
 mkdir -p "$WORK/polyfills" "$WORK/extra"

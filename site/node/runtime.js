@@ -342,9 +342,16 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       u.TextEncoder = TextEncoder; u.TextDecoder = TextDecoder;
       u.stripVTControlCharacters = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
       u.styleText = (_f, s) => s; u.parseArgs = undefined; u.getSystemErrorName = (c) => String(c); u.isDeepStrictEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-      // Like Node, an Error inspects as its stack.
+      // Like Node, an Error inspects as its stack, followed by its cause and an AggregateError's errors.
       const inspect = u.inspect || ((v) => String(v));
-      u.inspect = Object.assign((v, ...rest) => (v instanceof Error && v.stack ? v.stack : inspect(v, ...rest)), inspect);
+      const inspectError = (e, depth = 0) => {
+        const pad = "  ".repeat(depth);
+        let out = String(e.stack || e).split("\n").map((l) => pad + l).join("\n");
+        if (e instanceof AggregateError) for (const inner of e.errors || []) out += `\n${pad}  [errors]: ` + (inner instanceof Error ? inspectError(inner, depth + 2).trimStart() : String(inner));
+        if (e.cause !== undefined) out += `\n${pad}  [cause]: ` + (e.cause instanceof Error ? inspectError(e.cause, depth + 1).trimStart() : String(e.cause));
+        return out;
+      };
+      u.inspect = Object.assign((v, ...rest) => (v instanceof Error ? inspectError(v) : inspect(v, ...rest)), inspect);
       if (!u.inspect.custom) u.inspect.custom = Symbol.for("nodejs.util.inspect.custom");
       u.debuglog = () => Object.assign(() => {}, { enabled: false });
       return u;
@@ -491,14 +498,18 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
         return Promise.resolve(1);
       }
     }
-    // In a real thread, parentPort is the Web Worker's own message channel to its parent.
-    const parentPort = !worker ? null : worker.port
-      ? (() => {
-          const port = Object.assign(new EE(), { postMessage: (m, t) => worker.port.postMessage(m, t), close() {}, start() {}, ref() {}, unref() {} });
-          worker.port.addEventListener("message", (e) => port.emit("message", e.data));
-          return port;
-        })()
-      : Object.assign(new EE(), { postMessage() {}, close() {}, start() {}, ref() {}, unref() {} });
+    // parentPort is this thread's link to its parent. Like Node's, it holds incoming messages until the first
+    // 'message' listener is attached (code often awaits setup before listening).
+    const parentPort = !worker ? null : (() => {
+      const port = Object.assign(new EE(), { postMessage: (m, t) => worker.port.postMessage(m, t), close() {}, start() {}, ref() {}, unref() {} });
+      let started = false;
+      port.on("newListener", (event) => {
+        if (event !== "message" || started) return;
+        started = true;
+        worker.port.addEventListener("message", (e) => port.emit("message", e.data));
+      });
+      return port;
+    })();
     return {
       isMainThread: !worker, parentPort, workerData: worker ? worker.workerData : null, threadId: worker ? worker.threadId : 0,
       resourceLimits: {}, Worker, MessageChannel, MessagePort, BroadcastChannel, SHARE_ENV,

@@ -1,26 +1,19 @@
 // Decodes a fetched asset by extension: .gz with the browser's DecompressionStream, .br with brotli-dec-wasm
 // (browsers can't decode brotli in a stream yet, and brotli's large window makes the archive less than half the
-// size gzip gets).
-import initBrotli, { DecompressStream, BrotliStreamResultCode } from "/pkg/brotli_dec_wasm.js";
+// size gzip gets). Brotli decodes in one call once the download is complete: its streaming decoder can panic when a
+// network chunk ends exactly where an output block does.
+import initBrotli, { decompress } from "/pkg/brotli_dec_wasm.js";
 
 function brotli() {
-  let decoder, last;
+  const chunks = [];
   return new TransformStream({
-    async start() {
+    transform(chunk) { chunks.push(chunk); },
+    async flush(controller) {
       await initBrotli();
-      decoder = new DecompressStream();
-    },
-    transform(chunk, controller) {
-      let offset = 0;
-      do {
-        const result = decoder.decompress(chunk.subarray(offset), 1 << 20);
-        if (result.buf.length) controller.enqueue(result.buf);
-        offset += result.input_offset;
-        last = result.code;
-      } while (last === BrotliStreamResultCode.NeedsMoreOutput);
-    },
-    flush() {
-      if (last !== BrotliStreamResultCode.ResultSuccess) throw new Error("truncated brotli stream");
+      const input = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+      let at = 0;
+      for (const c of chunks) { input.set(c, at); at += c.length; }
+      controller.enqueue(decompress(input));
     },
   });
 }

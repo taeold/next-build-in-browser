@@ -41,14 +41,15 @@ const again = ["build another app", () => { location.href = location.pathname; }
 // ---------- boot ----------
 // The two big toolchain files come from jsDelivr, out of the repo's `assets` branch at a pinned commit
 // (scripts/publish-assets.sh), so the page's own host serves only small files. A local server uses its copies.
-const ASSETS = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? "/assets" : "https://cdn.jsdelivr.net/gh/taeold/next-build-in-browser@fd287ee7db0e399fd0d4db23995fec0dd2980dc7";
+const ASSETS = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? "/assets" : "https://cdn.jsdelivr.net/gh/taeold/next-build-in-browser@43874e83f18f1d7a9246462eb45073f91c6f223d";
 const toolchain = print("toolchain: loading", "faint");
 const fsWorker = new Worker("/fs-worker.js", { type: "module", name: "fs" });
 const fsReady = new Promise((resolve) => fsWorker.addEventListener("message", (e) => {
   if (e.data.type === "progress") toolchain.textContent = `toolchain: downloading ${mib(e.data.seen)}${e.data.total ? " / " + mib(e.data.total) : ""}`;
   if (e.data.type === "ready") resolve(e.data);
 }));
-fsWorker.postMessage({ type: "init", packs: [`${ASSETS}/base.pack.br`], extraDirs: ["/app", "/tmp", "/home/user"] });
+// The WASI binding's wasm goes where Next.js's own loader reads it, in its package.
+fsWorker.postMessage({ type: "init", packs: [`${ASSETS}/base.pack.br`], files: [[`${ASSETS}/next-swc.wasm.br`, "/app/node_modules/@next/swc-wasm-wasi/next-swc.wasm32-wasi.wasm"]], extraDirs: ["/app", "/tmp", "/home/user"] });
 
 const root = new MessageChannel();
 fsWorker.postMessage({ type: "registrar", port: root.port2 }, [root.port2]);
@@ -57,8 +58,8 @@ root.port1.postMessage({ type: "register", port: rpc.port2 }, [rpc.port2]);
 root.port1.postMessage({ type: "registrar", port: reg.port2 }, [reg.port2]);
 
 const host = new Worker("/next-host-worker.js", { type: "module", name: "next-build" });
-const bindingReady = new Promise((resolve) => host.addEventListener("message", (e) => e.data.type === "binding-ready" && resolve(e.data)));
-host.postMessage({ type: "start", fsPort: rpc.port1, regPort: reg.port1, wasmUrl: `${ASSETS}/next-swc.wasm.br`, parallelism: 2 }, [rpc.port1, reg.port1]);
+const hostReady = new Promise((resolve) => host.addEventListener("message", (e) => e.data.type === "ready" && resolve(e.data)));
+host.postMessage({ type: "start", fsPort: rpc.port1, regPort: reg.port1 }, [rpc.port1, reg.port1]);
 
 // The app picker: the sample, then the gallery of Next.js examples (scripts/snapshot-examples.mjs).
 const picker = document.createElement("select");
@@ -71,7 +72,7 @@ actions(start);
 const mobile = navigator.userAgentData?.mobile || /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
 $("mobile").hidden = !mobile;
 if (!crossOriginIsolated) say("this browser has no cross-origin isolation, so the build can't run", "bad");
-Promise.all([fsReady, bindingReady]).then(([f, b]) => { toolchain.textContent = `toolchain: ready · ${f.files.toLocaleString()} files · turbopack on ${b.threads} threads`; });
+Promise.all([fsReady, hostReady]).then(([f]) => { toolchain.textContent = `toolchain: ready · ${f.files.toLocaleString()} files`; });
 
 // ---------- reading an app ----------
 async function readEntry(entry, prefix, out) {
@@ -160,7 +161,7 @@ async function build(files, label, title) {
       fsWorker.postMessage({ type: "writeFiles", files: [...files.map(([p, b]) => ["/app/" + p, b]), ["/polyfills/node_modules/@vv/tailwind-oxide-js/index.js", scanner]] });
     });
     await npmInstall(files);
-    await bindingReady;
+    await hostReady;
     print(`<b>$ ${esc(framework.name)} ${esc(framework.args.join(" "))}</b>`);
     host.postMessage({ type: "run", appDir: "/app", polyfills: "/polyfills/node_modules", parallelism: 2, bin: framework.bin, args: framework.args, env: framework.env, outDir: framework.outDir, exitOnIdle: framework.exit === "idle" });
   } catch (e) {

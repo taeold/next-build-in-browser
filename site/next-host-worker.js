@@ -1,10 +1,8 @@
-// Runs the real `next build --wasi --experimental-build-mode compile` in this worker: Next's own JS on the small
-// runtime in node/runtime.js, Turbopack + SWC from the wasm binding instantiated here.
+// Runs a framework's build CLI (next build --wasi, vite build, ...) in this worker on the Node.js layer in
+// node/runtime.js. The CLI loads its own wasm tooling, as on Node.
 import { createFsClient } from "./fs-client.js";
 import { createThreadHost } from "./threads.js";
-import { createBinding } from "./binding.js";
 import { createRuntime } from "./node/runtime.js";
-import { getDefaultContext } from "/pkg/emnapi-runtime.mjs";
 
 // SWC's standalone wasm build compiles ES modules to CommonJS for require(): on this thread, and for worker threads
 // through threads.js. Pinned, from jsDelivr's npm mirror.
@@ -16,24 +14,18 @@ const sec = () => ((performance.now() - t0) / 1000).toFixed(2) + "s";
 const post = (type, text) => self.postMessage({ type, text });
 const log = (...a) => post("log", `[host +${sec()}] ${a.join(" ")}`);
 
-// "start" loads the wasm binding while the user picks an app; "run" starts next once the app is in the file system.
+// "start" connects the file system and loads SWC while the user picks an app; "run" starts the CLI once the app is in
+// the file system. Next.js loads its WASI binding itself (next build --wasi), as on Node.
 let started;
 self.onmessage = async ({ data }) => {
   if (data.type === "start") {
     const fsClient = createFsClient(data.fsPort, data.regPort);
-    started = createBinding({ fsClient, wasmUrl: data.wasmUrl, parallelism: data.parallelism }).then(({ exports, threadCount }) => {
-      // Errors thrown in callbacks that wasm calls into would otherwise be swallowed by emnapi.
-      const register = exports.registerWorkerScheduler;
-      const loud = (name, fn) => (...a) => { try { return fn(...a); } catch (e) { console.error(`${name} failed:`, e && (e.stack || e)); throw e; } };
-      if (register) exports.registerWorkerScheduler = (create, terminate) => register.call(exports, loud("loader worker create", create), loud("loader worker terminate", terminate));
-      globalThis.__NEXT_WASI_NAPI_EXPORTS__ = exports;
-      self.postMessage({ type: "binding-ready", target: exports.getTargetTriple(), threads: threadCount() });
-      return { fsClient, threadCount, exports };
-    }, (e) => { self.postMessage({ type: "done", ok: false, code: -1, error: String(e && (e.stack || e)) }); throw e; });
+    started = swcReady.then(() => { self.postMessage({ type: "ready" }); return { fsClient }; },
+      (e) => { self.postMessage({ type: "done", ok: false, code: -1, error: String(e && (e.stack || e)) }); throw e; });
     return;
   }
   if (data.type !== "run") return;
-  const { fsClient, threadCount, exports } = await started;
+  const { fsClient } = await started;
   const swc = await swcReady;
 
   let stdoutBuf = "";
@@ -65,15 +57,6 @@ self.onmessage = async ({ data }) => {
   // emnapi captured Buffer when its context was created, before the runtime installed the polyfill; Turbopack's loader
   // workers exchange messages as Buffers.
   rt.installGlobals();
-  const napiContext = getDefaultContext();
-  napiContext.features.Buffer = globalThis.Buffer;
-  // emnapi holds Node's event loop open while native async work is pending, but only builds that hold when process
-  // existed as the binding loaded, which it did not here. The same counter, on a MessagePort the runtime tracks.
-  if (!napiContext.refCounter) {
-    const port = new MessageChannel().port1;
-    let pending = 0;
-    napiContext.refCounter = { increase() { if (pending++ === 0) port.ref(); }, decrease() { if (pending > 0 && --pending === 0) port.unref(); } };
-  }
 
   let finished = false;
   const finish = (code, error) => {
@@ -92,7 +75,7 @@ self.onmessage = async ({ data }) => {
       }
     };
     try { walk(data.appDir + "/" + (data.outDir || ".next")); } catch {}
-    log(`next exited with code ${code}; .next holds ${outputs.length} files; ${threadCount()} wasm threads`);
+    log(`exited with code ${code}; ${outputs.length} output files`);
     // Hand .next to the page for display and download.
     const blobs = outputs.map(([p, , link]) => (link ? new TextEncoder().encode(link) : fsClient.readFileBytes(p)));
     const files = outputs.map(([p, , link], i) => [p.slice(data.appDir.length + 1), blobs[i], link]);

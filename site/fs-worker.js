@@ -226,8 +226,21 @@ function mountPack(bytes) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === "init") {
+    // Packs mount at the paths in their headers; each of `files` ([url, path]) becomes one file. All download at once.
+    const progress = new Map();
+    const report = (url) => (seen, total) => {
+      progress.set(url, [seen, total]);
+      let s = 0, t = 0; for (const [a, b] of progress.values()) { s += a; t += b; }
+      self.postMessage({ type: "progress", seen: s, total: t });
+    };
+    const fileList = data.files || [];
+    const [packs, singles] = await Promise.all([
+      Promise.all(data.packs.map((url) => fetchBytes(url, report(url)))),
+      Promise.all(fileList.map(([url]) => fetchBytes(url, report(url)))),
+    ]);
     let files = 0;
-    for (const url of data.packs) files += mountPack(await fetchBytes(url, (seen, total) => self.postMessage({ type: "progress", url, seen, total })));
+    for (const bytes of packs) files += mountPack(bytes);
+    fileList.forEach(([, path], i) => { addFile(norm(path), singles[i], 0o644, Date.now()); files++; });
     for (const d of data.extraDirs || []) addDir(d);
     self.postMessage({ type: "ready", files });
   } else if (data.type === "writeFiles") {
