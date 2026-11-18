@@ -1,0 +1,582 @@
+// Just enough Node.js for `next build --experimental-build-mode compile` in a worker: a CommonJS loader with
+// Node's Module shape (Next's require-hook patches Module._resolveFilename), `import()` routed through it, and a
+// registry of built-ins. Files come from fs-client.js; most built-ins are browserify-era polyfills.
+
+const BUILTIN_NAMES = [
+  "assert", "async_hooks", "buffer", "child_process", "console", "constants", "crypto", "diagnostics_channel", "dns", "dns/promises",
+  "events", "fs", "fs/promises", "http", "http2", "https", "inspector", "module", "net", "os", "path", "path/posix", "path/win32",
+  "perf_hooks", "process", "punycode", "querystring", "readline", "stream", "stream/promises", "stream/web", "string_decoder",
+  "timers", "timers/promises", "tls", "tty", "url", "util", "util/types", "v8", "vm", "wasi", "worker_threads", "zlib",
+];
+
+// `worker` makes this runtime an in-realm worker thread: same JS thread and globals, its own module cache.
+// `aliases` maps a require specifier straight to exports (e.g. the N-API binding the host already loaded).
+let nextThreadId = 0;
+// Shared by every runtime in this realm, so the host recognizes an exit thrown from any of them.
+class ProcessExit extends Error { constructor(code) { super(`process.exit(${code})`); this.code = code; } }
+// `redirects` maps a package name to another specifier or an absolute path (for stand-ins of native packages).
+// `transformEsm(source, filename)` compiles an ES module to CommonJS, so require() of ESM works as in Node 22+.
+export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worker = null, aliases = {}, redirects = {}, transformEsm = null }) {
+  const builtins = new Map();
+  const factories = {};
+  const builtinSet = new Set(BUILTIN_NAMES);
+  const isBuiltin = (id) => builtinSet.has(id.startsWith("node:") ? id.slice(5) : id);
+
+  // ---------- path helpers (posix only) ----------
+  const normalize = (p) => {
+    const abs = p.startsWith("/"), out = [];
+    for (const part of p.split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") { if (out.length && out[out.length - 1] !== "..") out.pop(); else if (!abs) out.push(".."); }
+      else out.push(part);
+    }
+    return (abs ? "/" : "") + out.join("/") || (abs ? "/" : ".");
+  };
+  const dirname = (p) => { const i = p.lastIndexOf("/"); return i <= 0 ? "/" : p.slice(0, i); };
+  const join = (...a) => normalize(a.join("/"));
+  const exists = (p) => { try { fsc.statSync(p); return true; } catch { return false; } };
+  const isFile = (p) => { try { return fsc.statSync(p).isFile(); } catch { return false; } };
+  const isDir = (p) => { try { return fsc.statSync(p).isDirectory(); } catch { return false; } };
+  const readText = (p) => new TextDecoder().decode(readBytes(p));
+  function readBytes(p) {
+    const st = fsc.statSync(p);
+    if (st.size < (15 << 20)) return fsc.readFileBytes(p);
+    const out = new Uint8Array(st.size), fd = fsc.openSync(p, "r");
+    try { fsc.readSync(fd, out, 0, st.size, 0); } finally { fsc.closeSync(fd); }
+    return out;
+  }
+
+  // ---------- process ----------
+  let EventEmitter; // filled once the events polyfill loads
+  let processObj;
+  function makeProcess() {
+    const EE = loadBuiltin("events");
+    const p = Object.assign(new EE(), {
+      env, argv, execArgv: [], execPath: "/usr/bin/node", argv0: "node", title: "node", pid: 1, ppid: 0,
+      platform: "linux", arch: "x64", version: "v24.0.0", versions: { node: "24.0.0", v8: "13.0", uv: "1.0", modules: "137" },
+      release: { name: "node" }, config: { variables: {} }, features: {}, exitCode: undefined, connected: false,
+      cwd: () => cwd, chdir: (d) => { cwd = normalize(d.startsWith("/") ? d : join(cwd, d)); },
+      umask: () => 0o22, getuid: () => 0, getgid: () => 0, geteuid: () => 0, uptime: () => performance.now() / 1000,
+      hrtime: Object.assign((prev) => {
+        const ns = BigInt(Math.round(performance.now() * 1e6)); const s = Number(ns / 1000000000n), n = Number(ns % 1000000000n);
+        if (!prev) return [s, n];
+        let ds = s - prev[0], dn = n - prev[1]; if (dn < 0) { ds--; dn += 1e9; } return [ds, dn];
+      }, { bigint: () => BigInt(Math.round(performance.now() * 1e6)) }),
+      memoryUsage: Object.assign(() => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }), { rss: () => 0 }),
+      cpuUsage: () => ({ user: 0, system: 0 }), resourceUsage: () => ({}),
+      nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
+      emitWarning: (w) => write(2, `(warning) ${w && w.message ? w.message : w}\n`),
+      binding: () => ({}), _getActiveHandles: () => [], _getActiveRequests: () => [],
+      exit: (code) => { p.exitCode = code ?? p.exitCode ?? 0; p.emit("exit", p.exitCode); throw new ProcessExit(p.exitCode); },
+      kill: () => true, abort: () => { throw new Error("process.abort()"); },
+      setUncaughtExceptionCaptureCallback() {}, hasUncaughtExceptionCaptureCallback: () => false,
+    });
+    p.setMaxListeners(0);
+    processObj = p; globalThis.process = p; // the stream polyfill reads the global process while loading
+    // Real streams: ora and friends pipe into stdout and listen on stdin.
+    const { Writable, Readable } = loadBuiltin("stream");
+    const out = (fd) => Object.assign(new Writable({ write(chunk, _e, cb) { write(fd, typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk)); cb(); } }), { isTTY: false, columns: 120, rows: 40, fd, _handle: null, getColorDepth: () => 1, hasColors: () => false, cursorTo() { return true; }, moveCursor() { return true; }, clearLine() { return true; }, getWindowSize: () => [120, 40] });
+    p.stdout = out(1); p.stderr = out(2);
+    p.stdin = Object.assign(new Readable({ read() {} }), { isTTY: false, fd: 0, setRawMode() { return this; }, ref() { return this; }, unref() { return this; } });
+    return p;
+  }
+
+  // ---------- module loader ----------
+  class Module {
+    constructor(id = "", parent) { this.id = id; this.filename = id; this.exports = {}; this.loaded = false; this.children = []; this.parent = parent; this.paths = Module._nodeModulePaths(dirname(id || cwd)); }
+    require(id) { return Module._load(id, this, false); }
+    _compile(content, filename) { return compileModule(this, content, filename); }
+    static _nodeModulePaths(from) {
+      const out = []; let d = normalize(from);
+      for (;;) { if (!d.endsWith("/node_modules")) out.push(join(d, "node_modules")); if (d === "/") break; d = dirname(d); }
+      return out;
+    }
+    static _resolveFilename(request, parent) { return resolve(request, parent ? dirname(parent.filename || join(cwd, "x")) : cwd, parent); }
+    static _load(request, parent) {
+      if (Object.prototype.hasOwnProperty.call(aliases, request)) return aliases[request];
+      for (const [from, to] of Object.entries(redirects)) if (request === from || request.startsWith(from + "/")) { request = to + request.slice(from.length); break; }
+      if (isBuiltin(request)) return loadBuiltin(request);
+      const filename = Module._resolveFilename(request, parent, false);
+      if (isBuiltin(filename)) return loadBuiltin(filename);
+      const cached = Module._cache[filename];
+      if (cached) return cached.exports;
+      const m = new Module(filename, parent);
+      Module._cache[filename] = m;
+      if (parent && parent.children) parent.children.push(m);
+      try { m.load(filename); } catch (e) { delete Module._cache[filename]; throw e; }
+      return m.exports;
+    }
+    load(filename) {
+      const ext = filename.endsWith(".json") ? ".json" : filename.endsWith(".node") ? ".node" : ".js";
+      Module._extensions[ext](this, filename);
+      this.loaded = true;
+    }
+    static createRequire(from) {
+      const f = String(from).startsWith("file:") ? decodeURIComponent(new URL(from).pathname) : String(from);
+      const m = new Module(f.endsWith("/") ? join(f, "noop.js") : f); return makeRequire(m);
+    }
+    static isBuiltin(id) { return isBuiltin(id); }
+  }
+  Module._cache = Object.create(null);
+  Module._extensions = {
+    ".js": (m, filename) => m._compile(readText(filename), filename),
+    ".json": (m, filename) => { m.exports = JSON.parse(readText(filename)); },
+    ".node": (m, filename) => { throw Object.assign(new Error(`Cannot load native addon ${filename} in the browser`), { code: "ERR_DLOPEN_FAILED" }); },
+  };
+  Module.builtinModules = BUILTIN_NAMES.slice();
+  Module.Module = Module;
+  Module.wrap = (s) => `(function (exports, require, module, __filename, __dirname) { ${s}\n});`;
+  Module.register = () => {}; Module.enableCompileCache = () => ({}); Module.syncBuiltinESMExports = () => {};
+  Module.findSourceMap = () => undefined; Module.SourceMap = class {};
+
+  function makeRequire(m) {
+    const req = (id) => m.require(id);
+    req.resolve = (id, opts) => {
+      if (isBuiltin(id)) return id;
+      if (opts && opts.paths) {
+        for (const base of opts.paths) { try { return resolve(id, base, m); } catch {} }
+        throw notFound(id, m);
+      }
+      return Module._resolveFilename(id, m, false, opts);
+    };
+    req.resolve.paths = (id) => (isBuiltin(id) ? null : Module._nodeModulePaths(dirname(m.filename || cwd)));
+    req.cache = Module._cache; req.main = mainModule; req.extensions = Module._extensions;
+    return req;
+  }
+  let mainModule;
+
+  const notFound = (id, parent) => Object.assign(new Error(`Cannot find module '${id}'${parent && parent.filename ? `\nRequire stack:\n- ${parent.filename}` : ""}`), { code: "MODULE_NOT_FOUND" });
+  const pkgCache = new Map();
+  const readPkg = (dir) => {
+    if (pkgCache.has(dir)) return pkgCache.get(dir);
+    let pkg = null; const f = join(dir, "package.json");
+    if (isFile(f)) { try { pkg = JSON.parse(readText(f)); } catch { pkg = null; } }
+    pkgCache.set(dir, pkg); return pkg;
+  };
+  const CONDITIONS = ["node", "require", "default"];
+  function resolveExportsTarget(target, subpathRest) {
+    if (typeof target === "string") return target.replace(/\*/g, subpathRest);
+    if (Array.isArray(target)) { for (const t of target) { const r = resolveExportsTarget(t, subpathRest); if (r) return r; } return null; }
+    if (target && typeof target === "object") {
+      for (const [k, v] of Object.entries(target)) if (CONDITIONS.includes(k)) { const r = resolveExportsTarget(v, subpathRest); if (r) return r; }
+    }
+    return null;
+  }
+  function resolveExports(pkgDir, exportsField, subpath) {
+    let map = exportsField;
+    if (typeof map === "string" || Array.isArray(map) || (map && !Object.keys(map).some((k) => k.startsWith(".")))) map = { ".": map };
+    if (map[subpath] !== undefined) { const t = resolveExportsTarget(map[subpath], ""); return t ? join(pkgDir, t) : null; }
+    for (const key of Object.keys(map)) {
+      const star = key.indexOf("*");
+      if (star < 0) continue;
+      const pre = key.slice(0, star), post = key.slice(star + 1);
+      if (subpath.startsWith(pre) && subpath.endsWith(post) && subpath.length >= key.length - 1) {
+        const t = resolveExportsTarget(map[key], subpath.slice(pre.length, subpath.length - post.length));
+        return t ? join(pkgDir, t) : null;
+      }
+    }
+    return null;
+  }
+  const EXTS = ["", ".js", ".json", ".cjs", ".node"];
+  function tryFile(p) { for (const e of EXTS) if (isFile(p + e)) return p + e; return null; }
+  // Polyfill packages (and only those) resolve with their `browser` field, like a browser bundler would.
+  const underPolyfills = (p) => p.startsWith(polyfills + "/");
+  function browserMap(pkgDir, file) {
+    const pkg = readPkg(pkgDir);
+    if (!pkg || !pkg.browser || typeof pkg.browser !== "object") return file;
+    const rel = "./" + file.slice(pkgDir.length + 1);
+    for (const [from, to] of Object.entries(pkg.browser)) {
+      const f = from.startsWith("./") ? from : "./" + from;
+      if ((f === rel || f + ".js" === rel || f === rel.replace(/\.js$/, "")) && typeof to === "string") return join(pkgDir, to);
+    }
+    return file;
+  }
+  function packageDirOf(file) { let d = dirname(file); for (;;) { if (readPkg(d)) return d; if (d === "/" || d === polyfills) return null; d = dirname(d); } }
+  function tryDir(p) {
+    const pkg = readPkg(p);
+    if (pkg && underPolyfills(p) && typeof pkg.browser === "string") { const b = tryFile(join(p, pkg.browser)); if (b) return b; }
+    if (pkg && pkg.main) { const m = tryFile(join(p, pkg.main)) || tryIndex(join(p, pkg.main)); if (m) return underPolyfills(p) ? browserMap(p, m) : m; }
+    const idx = tryIndex(p);
+    return idx && underPolyfills(p) ? browserMap(p, idx) : idx;
+  }
+  function tryIndex(p) { for (const e of [".js", ".json", ".cjs"]) if (isFile(join(p, "index" + e))) return join(p, "index" + e); return null; }
+  function resolve(request, basedir, parent) {
+    if (request.startsWith("file:")) request = decodeURIComponent(new URL(request).pathname);
+    if (request.startsWith("/") || request.startsWith("./") || request.startsWith("../") || request === "." || request === "..") {
+      const p = request.startsWith("/") ? normalize(request) : join(basedir, request);
+      let r = tryFile(p) || (isDir(p) ? tryDir(p) : null);
+      if (r && underPolyfills(r)) { const pd = packageDirOf(r); if (pd) r = browserMap(pd, r); }
+      if (r) return r;
+      throw notFound(request, parent);
+    }
+    if (request.startsWith("#")) {
+      let d = basedir;
+      for (;;) {
+        const pkg = readPkg(d);
+        if (pkg && pkg.imports) { const t = resolveExports(d, pkg.imports, request); if (t && isFile(t)) return t; if (t) { const bare = resolve(t.slice(d.length + 1), d, parent); return bare; } }
+        if (pkg || d === "/") break; d = dirname(d);
+      }
+      throw notFound(request, parent);
+    }
+    if (underPolyfills(basedir)) {
+      const pd = packageDirOf(join(basedir, "x.js")); const pkg = pd && readPkg(pd);
+      if (pkg && pkg.browser && typeof pkg.browser === "object" && request in pkg.browser) {
+        const to = pkg.browser[request];
+        if (to === false) return join(polyfills, "../empty.js");
+        if (typeof to === "string") return to.startsWith(".") ? resolve(to, pd, parent) : resolve(to, basedir, parent);
+      }
+    }
+    const parts = request.split("/");
+    const name = request.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+    const subpath = "." + request.slice(name.length);
+    for (const nm of Module._nodeModulePaths(basedir)) {
+      const pkgDir = join(nm, name);
+      if (!isDir(pkgDir)) continue;
+      const pkg = readPkg(pkgDir);
+      if (pkg && pkg.exports !== undefined) {
+        const t = resolveExports(pkgDir, pkg.exports, subpath);
+        if (t) { const f = tryFile(t); if (f) return f; }
+      }
+      const p = join(pkgDir, subpath);
+      const r = subpath === "." ? tryDir(pkgDir) : tryFile(p) || (isDir(p) ? tryDir(p) : null);
+      if (r) return r;
+    }
+    throw notFound(request, parent);
+  }
+
+  async function dynamicImport(spec, fromFile) {
+    if (isBuiltin(spec)) { const ex = loadBuiltin(spec); return { ...ex, default: ex }; }
+    const filename = resolve(spec, dirname(fromFile), null);
+    const ex = Module._load(filename, null);
+    return ex && ex.__esModule ? { ...ex, default: ex.default ?? ex } : { ...(typeof ex === "object" ? ex : {}), default: ex };
+  }
+  function isEsmPackage(f) { let d = dirname(f); for (;;) { const pkg = readPkg(d); if (pkg) return pkg.type === "module"; if (d === "/") return false; d = dirname(d); } }
+
+  const isEsmFile = (f) => f.endsWith(".mjs") || (f.endsWith(".js") && isEsmPackage(f));
+  function compileModule(m, content, filename) {
+    if (content.startsWith("#!")) content = "//" + content.slice(2);
+    if (transformEsm && isEsmFile(filename)) {
+      content = content
+        .replace(/\bimport\.meta\.url\b/g, 'require("url").pathToFileURL(__filename).href')
+        .replace(/\bimport\.meta\.dirname\b/g, "__dirname")
+        .replace(/\bimport\.meta\.filename\b/g, "__filename");
+      content = transformEsm(content, filename);
+    }
+    const src = content.replace(/(^|[^.\w$])import\(/g, "$1__vv_import(");
+    let wrapper;
+    try { wrapper = (0, eval)(`(function (exports, require, module, __filename, __dirname, __vv_import) {${src}\n})\n//# sourceURL=file://${filename}`); }
+    catch (e) { if (e instanceof SyntaxError) e.message += ` (in ${filename})`; throw e; }
+    const req = makeRequire(m);
+    m.require = (id) => Module._load(id, m, false);
+    return wrapper.call(m.exports, m.exports, req, m, filename, dirname(filename), (s) => dynamicImport(String(s), filename));
+  }
+
+  // ---------- built-ins ----------
+  const poly = (pkg) => Module._load(join(polyfills, pkg), null);
+  function loadBuiltin(id) {
+    const name = id.startsWith("node:") ? id.slice(5) : id;
+    if (builtins.has(name)) return builtins.get(name);
+    const make = factories[name];
+    if (!make) throw Object.assign(new Error(`No such built-in module: ${name}`), { code: "ERR_UNKNOWN_BUILTIN_MODULE" });
+    const placeholder = {}; builtins.set(name, placeholder);
+    const ex = make();
+    builtins.set(name, ex);
+    return ex;
+  }
+  const stubClass = (label) => class { constructor() { throw new Error(`${label} is not available in the browser build host`); } };
+
+  Object.assign(factories, {
+    events: () => { const ev = poly("events"); EventEmitter = ev; ev.EventEmitter = ev; ev.setMaxListeners = ev.setMaxListeners || (() => {}); ev.getEventListeners = (e, n) => e.listeners(n); return ev; },
+    buffer: () => { const b = poly("buffer"); b.constants = { MAX_LENGTH: b.kMaxLength, MAX_STRING_LENGTH: 2 ** 29 }; b.isUtf8 = () => true; return b; },
+    util: () => {
+      const u = poly("util");
+      u.types = Object.assign({}, u.types || {}, { isPromise: (v) => v instanceof Promise, isRegExp: (v) => v instanceof RegExp, isDate: (v) => v instanceof Date, isNativeError: (v) => v instanceof Error, isAnyArrayBuffer: (v) => v instanceof ArrayBuffer || v instanceof SharedArrayBuffer, isUint8Array: (v) => v instanceof Uint8Array, isProxy: () => false, isAsyncFunction: (f) => f && f.constructor && f.constructor.name === "AsyncFunction", isGeneratorFunction: (f) => f && f.constructor && /GeneratorFunction/.test(f.constructor.name) });
+      u.TextEncoder = TextEncoder; u.TextDecoder = TextDecoder;
+      u.stripVTControlCharacters = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
+      u.styleText = (_f, s) => s; u.parseArgs = undefined; u.getSystemErrorName = (c) => String(c); u.isDeepStrictEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+      u.inspect = u.inspect || ((v) => String(v)); if (!u.inspect.custom) u.inspect.custom = Symbol.for("nodejs.util.inspect.custom");
+      u.debuglog = () => Object.assign(() => {}, { enabled: false });
+      return u;
+    },
+    "util/types": () => loadBuiltin("util").types,
+    path: () => { const p = poly("path-browserify"); p.posix = p; p.win32 = p; p.toNamespacedPath = (x) => x; return p; },
+    "path/posix": () => loadBuiltin("path"), "path/win32": () => loadBuiltin("path"),
+    stream: () => { const s = poly("stream-browserify"); const rs = poly("readable-stream"); s.promises = { pipeline: (...a) => new Promise((res, rej) => rs.pipeline(...a, (e) => (e ? rej(e) : res()))), finished: (st) => new Promise((res, rej) => rs.finished(st, (e) => (e ? rej(e) : res()))) }; s.finished = rs.finished; s.pipeline = rs.pipeline; s.addAbortSignal = (_s, st) => st; s.Readable.fromWeb = s.Readable.fromWeb || (() => { throw new Error("Readable.fromWeb unsupported"); }); return s; },
+    "stream/promises": () => loadBuiltin("stream").promises,
+    "stream/web": () => ({ ReadableStream, WritableStream, TransformStream, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream, ByteLengthQueuingStrategy, CountQueuingStrategy }),
+    string_decoder: () => poly("string_decoder"),
+    querystring: () => poly("querystring-es3"),
+    punycode: () => poly("punycode"),
+    assert: () => { const a = poly("assert"); a.strict = a; return a; },
+    zlib: () => { const z = poly("browserify-zlib"); z.constants = z.constants || {}; z.brotliCompressSync = (b) => b; z.brotliDecompressSync = (b) => b; z.createBrotliCompress = () => { throw new Error("brotli unsupported"); }; return z; },
+    url: () => {
+      const u = poly("url");
+      u.URL = URL; u.URLSearchParams = URLSearchParams;
+      u.pathToFileURL = (p) => new URL("file://" + encodeURI(p.startsWith("/") ? p : join(cwd, p)).replace(/\?/g, "%3F").replace(/#/g, "%23"));
+      u.fileURLToPath = (x) => decodeURIComponent(new URL(String(x)).pathname);
+      u.domainToASCII = (d) => d; u.urlToHttpOptions = (x) => x;
+      return u;
+    },
+    os: () => {
+      const o = poly("os-browserify");
+      return Object.assign({}, o, { platform: () => "linux", type: () => "Linux", arch: () => "x64", release: () => "6.0.0", tmpdir: () => "/tmp", homedir: () => env.HOME || "/home/user", hostname: () => "browser", EOL: "\n", cpus: () => Array.from({ length: 2 }, () => ({ model: "browser", speed: 0, times: {} })), availableParallelism: () => 2, totalmem: () => 4 << 30, freemem: () => 2 << 30, endianness: () => "LE", userInfo: () => ({ username: "user", uid: 0, gid: 0, shell: "/bin/sh", homedir: env.HOME || "/home/user" }), networkInterfaces: () => ({}), loadavg: () => [0, 0, 0], uptime: () => 0, constants: { signals: {}, errno: {} }, devNull: "/dev/null", machine: () => "x86_64", version: () => "browser" });
+    },
+    crypto: () => {
+      const createHash = poly("create-hash"), createHmac = poly("create-hmac"), randomBytes = poly("randombytes");
+      const Buffer = loadBuiltin("buffer").Buffer;
+      return {
+        createHash, createHmac, randomBytes, webcrypto: crypto, subtle: crypto.subtle,
+        randomUUID: () => crypto.randomUUID(), getRandomValues: (a) => crypto.getRandomValues(a),
+        randomFillSync: (a) => { crypto.getRandomValues(new Uint8Array(a.buffer, a.byteOffset, a.byteLength)); return a; },
+        randomInt: (a, b) => { if (b === undefined) { b = a; a = 0; } return a + Math.floor(Math.random() * (b - a)); },
+        timingSafeEqual: (a, b) => a.length === b.length && Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0,
+        getHashes: () => ["md5", "sha1", "sha256", "sha512"], constants: {},
+        hash: (alg, data, enc = "hex") => createHash(alg).update(data).digest(enc),
+      };
+    },
+    fs: () => makeFs(), "fs/promises": () => loadBuiltin("fs").promises,
+    constants: () => ({ O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 }),
+    module: () => Module,
+    // Worker runtimes share the main runtime's process, as in-realm threads share globals.
+    process: () => processObj || (processObj = worker && globalThis.process ? globalThis.process : makeProcess()),
+    console: () => Object.assign(Object.create(console), { Console: class { constructor() { return console; } } }),
+    timers: () => ({ setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout, setInterval: globalThis.setInterval, clearInterval: globalThis.clearInterval, setImmediate: globalThis.setImmediate, clearImmediate: globalThis.clearImmediate }),
+    "timers/promises": () => ({ setTimeout: (ms, v) => new Promise((r) => setTimeout(() => r(v), ms)), setImmediate: (v) => new Promise((r) => globalThis.setImmediate(() => r(v))), scheduler: { wait: (ms) => new Promise((r) => setTimeout(r, ms)), yield: () => new Promise((r) => setTimeout(r, 0)) } }),
+    perf_hooks: () => ({ performance, PerformanceObserver: class { observe() {} disconnect() {} }, monitorEventLoopDelay: () => ({ enable() {}, disable() {}, percentile: () => 0 }), constants: {} }),
+    async_hooks: () => makeAsyncHooks(),
+    diagnostics_channel: () => { const ch = () => ({ hasSubscribers: false, publish() {}, subscribe() {}, unsubscribe() {}, bindStore() {}, runStores: (_d, fn, t, ...a) => fn.apply(t, a) }); return { channel: ch, hasSubscribers: () => false, subscribe() {}, unsubscribe() {}, tracingChannel: () => ({ start: ch(), end: ch(), asyncStart: ch(), asyncEnd: ch(), error: ch(), hasSubscribers: false, traceSync: (fn, _c, t, ...a) => fn.apply(t, a), tracePromise: (fn, _c, t, ...a) => fn.apply(t, a), traceCallback: (fn, _p, _c, t, ...a) => fn.apply(t, a) }) }; },
+    vm: () => {
+      const runInContext = (code, ctx) => { const keys = Object.keys(ctx || {}); return Function(...keys, `return eval(${JSON.stringify(String(code))})`)(...keys.map((k) => ctx[k])); };
+      class Script { constructor(code) { this.code = code; } runInThisContext() { return (0, eval)(this.code); } runInNewContext(ctx) { return runInContext(this.code, ctx); } runInContext(ctx) { return runInContext(this.code, ctx); } createCachedData() { return new Uint8Array(0); } }
+      return { Script, runInThisContext: (c) => (0, eval)(c), runInNewContext: runInContext, runInContext, createContext: (c = {}) => c, isContext: () => true, compileFunction: (code, params = []) => Function(...params, code), constants: {} };
+    },
+    v8: () => ({ getHeapStatistics: () => ({ heap_size_limit: 4 << 30, total_heap_size: 0, used_heap_size: 0 }), getHeapSpaceStatistics: () => [], setFlagsFromString() {}, serialize: (v) => new TextEncoder().encode(JSON.stringify(v)), deserialize: (b) => JSON.parse(new TextDecoder().decode(b)), writeHeapSnapshot: () => "", startupSnapshot: { isBuildingSnapshot: () => false } }),
+    tty: () => ({ isatty: () => false, WriteStream: stubClass("tty.WriteStream"), ReadStream: stubClass("tty.ReadStream") }),
+    readline: () => ({ createInterface: () => ({ on() { return this; }, close() {}, question(_q, cb) { cb(""); } }), emitKeypressEvents() {}, clearLine() {}, cursorTo() {}, moveCursor() {} }),
+    worker_threads: () => makeWorkerThreads(),
+    child_process: () => makeChildProcess(),
+    http: () => ({ STATUS_CODES: {}, METHODS: ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], createServer: () => { throw new Error("http.createServer is not available in the browser build host"); }, Agent: class { constructor() {} }, globalAgent: {}, request: () => { throw new Error("http.request is not available"); }, get: () => { throw new Error("http.get is not available"); }, IncomingMessage: class {}, ServerResponse: class {}, Server: class {}, OutgoingMessage: class {}, validateHeaderName() {}, validateHeaderValue() {} }),
+    https: () => loadBuiltin("http"), http2: () => ({ constants: {}, connect: () => { throw new Error("http2 is not available"); } }),
+    net: () => ({ isIP: (s) => (/^\d+\.\d+\.\d+\.\d+$/.test(s) ? 4 : s.includes(":") ? 6 : 0), isIPv4: (s) => /^\d+\.\d+\.\d+\.\d+$/.test(s), isIPv6: (s) => s.includes(":"), Socket: class {}, createServer: () => { throw new Error("net.createServer is not available"); }, connect: () => { throw new Error("net.connect is not available"); } }),
+    tls: () => ({ connect: () => { throw new Error("tls is not available"); } }),
+    dns: () => ({ lookup: (_h, _o, cb) => (cb || _o)(new Error("dns unavailable")), promises: { lookup: async () => { throw new Error("dns unavailable"); } } }),
+    "dns/promises": () => loadBuiltin("dns").promises,
+    inspector: () => ({ url: () => undefined, open() {}, close() {}, Session: class { connect() {} post() {} disconnect() {} } }),
+    wasi: () => ({ WASI: stubClass("node:wasi") }),
+  });
+
+  // Turbopack's loader workers (PostCSS and friends) talk to the binding only through async calls, so they can run
+  // on this thread: each Worker gets a child runtime with its own module cache, sharing files and the binding.
+  function makeWorkerThreads() {
+    const EE = loadBuiltin("events");
+    const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
+    class Worker extends EE {
+      constructor(file, opts = {}) {
+        super();
+        this.threadId = ++nextThreadId;
+        const filename = String(file).startsWith("file:") ? decodeURIComponent(new URL(String(file)).pathname) : String(file);
+        const child = createRuntime({
+          fs: fsc, cwd, polyfills, write, aliases, redirects, transformEsm,
+          env: opts.env && opts.env !== SHARE_ENV ? { ...opts.env } : env,
+          argv: [argv[0], filename, ...(opts.argv || []).map(String)],
+          worker: { workerData: opts.workerData === undefined ? null : opts.workerData, threadId: this.threadId },
+        });
+        setTimeout(() => {
+          try { child.runWorker(filename); this.emit("online"); }
+          catch (e) { this.emit("error", e); this.emit("exit", 1); }
+        }, 0);
+      }
+      postMessage() {}
+      ref() { return this; }
+      unref() { return this; }
+      terminate() { setTimeout(() => this.emit("exit", 1), 0); return Promise.resolve(1); }
+    }
+    const parentPort = worker ? Object.assign(new EE(), { postMessage() {}, close() {}, start() {}, ref() {}, unref() {} }) : null;
+    return {
+      isMainThread: !worker, parentPort, workerData: worker ? worker.workerData : null, threadId: worker ? worker.threadId : 0,
+      resourceLimits: {}, Worker, MessageChannel, MessagePort, BroadcastChannel, SHARE_ENV,
+      markAsUntransferable() {}, receiveMessageOnPort: () => undefined, getEnvironmentData() {}, setEnvironmentData() {},
+    };
+  }
+
+  function makeAsyncHooks() {
+    // One render at a time: the store set by run() stays current for the async work it starts until run() is
+    // entered again. Enough for the compile path, which does not prerender.
+    class AsyncLocalStorage {
+      constructor() { this._store = undefined; }
+      static bind(fn) { return fn; }
+      static snapshot() { return (fn, ...a) => fn(...a); }
+      getStore() { return this._store; }
+      run(store, fn, ...args) { const prev = this._store; this._store = store; try { const r = fn(...args); if (r && typeof r.then === "function") return r.finally(() => { if (this._store === store) this._store = prev; }); this._store = prev; return r; } catch (e) { this._store = prev; throw e; } }
+      exit(fn, ...args) { const prev = this._store; this._store = undefined; try { return fn(...args); } finally { this._store = prev; } }
+      enterWith(store) { this._store = store; }
+      disable() { this._store = undefined; }
+    }
+    class AsyncResource { constructor(type) { this.type = type; } runInAsyncScope(fn, thisArg, ...args) { return fn.apply(thisArg, args); } emitDestroy() { return this; } bind(fn) { return fn.bind(this); } static bind(fn) { return fn; } asyncId() { return 1; } triggerAsyncId() { return 0; } }
+    return { AsyncLocalStorage, AsyncResource, createHook: () => ({ enable() { return this; }, disable() { return this; } }), executionAsyncId: () => 1, triggerAsyncId: () => 0, executionAsyncResource: () => ({}) };
+  }
+
+  function makeChildProcess() {
+    // Next's compile mode creates a static-check worker it never calls; a child that stays silent is enough.
+    const { EventEmitter: EE } = loadBuiltin("events");
+    const fakeChild = () => { const c = new EE(); c.pid = 0; c.connected = true; c.killed = false; c.stdout = new EE(); c.stderr = new EE(); c.stdin = Object.assign(new EE(), { write() { return true; }, end() {} }); c.send = () => true; c.kill = () => { c.killed = true; c.connected = false; setTimeout(() => c.emit("exit", 0, null), 0); return true; }; c.disconnect = () => { c.connected = false; }; c.ref = c.unref = () => {}; return c; };
+    const nope = (name) => () => { throw Object.assign(new Error(`child_process.${name} is not available in the browser build host`), { code: "ENOSYS" }); };
+    return { fork: () => fakeChild(), spawn: () => fakeChild(), exec: (_c, _o, cb) => { (cb || _o)?.(new Error("exec unavailable"), "", ""); return fakeChild(); }, execFile: (_f, _a, _o, cb) => { (cb || _o || _a)?.(new Error("execFile unavailable"), "", ""); return fakeChild(); }, execSync: nope("execSync"), execFileSync: nope("execFileSync"), spawnSync: () => ({ status: 1, error: new Error("spawnSync unavailable"), stdout: "", stderr: "" }), ChildProcess: class {} };
+  }
+
+  function makeFs() {
+    const Buffer = loadBuiltin("buffer").Buffer;
+    const MESSAGES = { ENOENT: "no such file or directory", EEXIST: "file already exists", ENOTDIR: "not a directory", EISDIR: "illegal operation on a directory", ENOTEMPTY: "directory not empty", EBADF: "bad file descriptor", EPERM: "operation not permitted", EINVAL: "invalid argument" };
+    const ERRNO = { ENOENT: -2, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39, EBADF: -9, EPERM: -1, EINVAL: -22 };
+    const wrap = (syscall, fn) => (...args) => {
+      try { return fn(...args); } catch (e) {
+        if (!e.code || e.syscall) throw e;
+        const path = typeof args[0] === "string" ? args[0] : undefined;
+        const err = new Error(`${e.code}: ${MESSAGES[e.code] || e.message}, ${syscall}${path ? ` '${path}'` : ""}`);
+        Object.assign(err, { code: e.code, errno: ERRNO[e.code], syscall, path });
+        throw err;
+      }
+    };
+    const abs = (p) => { p = p instanceof URL ? decodeURIComponent(p.pathname) : String(p); if (p.startsWith("file:")) p = decodeURIComponent(new URL(p).pathname); return p.startsWith("/") ? normalize(p) : join(cwd, p); };
+    const enc = (o) => (typeof o === "string" ? o : o && o.encoding);
+    const toBytes = (d, e) => (typeof d === "string" ? Buffer.from(d, e || "utf8") : d instanceof Uint8Array ? d : Buffer.from(d.buffer ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : d));
+    const statOrUndef = (fn, p, o) => { try { return fn(abs(p), o); } catch (e) { if (o && o.throwIfNoEntry === false && e.code === "ENOENT") return undefined; throw e; } };
+    const mkdirp = (p) => { const parts = p.split("/").filter(Boolean); let cur = ""; for (const part of parts) { cur += "/" + part; try { fsc.mkdirSync(cur); } catch (e) { if (e.code !== "EEXIST") throw e; } } };
+    const rmrf = (p) => { let st; try { st = fsc.lstatSync(p); } catch (e) { if (e.code === "ENOENT") return; throw e; } if (st.isDirectory()) { for (const n of fsc.readdirSync(p)) rmrf(join(p, n)); fsc.rmdirSync(p); } else fsc.unlinkSync(p); };
+    const s = {
+      existsSync: (p) => { try { fsc.statSync(abs(p)); return true; } catch { return false; } },
+      readFileSync: wrap("open", (p, o) => { const b = Buffer.from(readBytes(typeof p === "number" ? (() => { throw Object.assign(new Error("fd read"), { code: "EBADF" }); })() : abs(p))); const e = enc(o); return e ? b.toString(e) : b; }),
+      writeFileSync: wrap("open", (p, d, o) => fsc.writeFileBytes(abs(p), toBytes(d, enc(o)))),
+      appendFileSync: wrap("open", (p, d, o) => { let prev = new Uint8Array(0); try { prev = readBytes(abs(p)); } catch {} fsc.writeFileBytes(abs(p), Buffer.concat([Buffer.from(prev), Buffer.from(toBytes(d, enc(o)))])); }),
+      statSync: wrap("stat", (p, o) => statOrUndef(fsc.statSync, p, o)),
+      lstatSync: wrap("lstat", (p, o) => statOrUndef(fsc.lstatSync, p, o)),
+      fstatSync: wrap("fstat", (fd, o) => fsc.fstatSync(fd, o)),
+      readdirSync: wrap("scandir", (p, o) => {
+        const dir = abs(p), types = !!(o && o.withFileTypes), recursive = !!(o && o.recursive);
+        const list = [];
+        const visit = (d, prefix) => {
+          for (const e of fsc.readdirSync(d, { withFileTypes: true })) {
+            const rel = prefix ? prefix + "/" + e.name : e.name;
+            if (types) { e.parentPath = e.path = d; list.push(e); } else list.push(rel);
+            if (recursive && e.isDirectory()) visit(join(d, e.name), rel);
+          }
+        };
+        visit(dir, "");
+        return list;
+      }),
+      opendirSync: wrap("opendir", (p) => {
+        const entries = s.readdirSync(p, { withFileTypes: true }); let i = 0;
+        const next = () => (i < entries.length ? entries[i++] : null);
+        return { path: abs(p), readSync: next, read: async () => next(), closeSync() {}, close: async () => {}, async *[Symbol.asyncIterator]() { let e; while ((e = next())) yield e; }, *[Symbol.iterator]() { let e; while ((e = next())) yield e; } };
+      }),
+      mkdirSync: wrap("mkdir", (p, o) => { p = abs(p); if (o && (o.recursive || o === true)) { const existed = s.existsSync(p); mkdirp(p); return existed ? undefined : p; } fsc.mkdirSync(p); }),
+      rmSync: wrap("rm", (p, o) => { p = abs(p); if (!s.existsSync(p)) { if (o && o.force) return; throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); } if (o && o.recursive) rmrf(p); else fsc.unlinkSync(p); }),
+      rmdirSync: wrap("rmdir", (p, o) => (o && o.recursive ? rmrf(abs(p)) : fsc.rmdirSync(abs(p)))),
+      unlinkSync: wrap("unlink", (p) => fsc.unlinkSync(abs(p))),
+      renameSync: wrap("rename", (a, b) => fsc.renameSync(abs(a), abs(b))),
+      copyFileSync: wrap("copyfile", (a, b) => fsc.writeFileBytes(abs(b), readBytes(abs(a)))),
+      cpSync: wrap("cp", (a, b, o) => { const copy = (x, y) => { const st = fsc.statSync(x); if (st.isDirectory()) { mkdirp(y); for (const n of fsc.readdirSync(x)) copy(join(x, n), join(y, n)); } else fsc.writeFileBytes(y, readBytes(x)); }; copy(abs(a), abs(b)); }),
+      realpathSync: Object.assign(wrap("realpath", (p) => fsc.realpathSync(abs(p))), { native: wrap("realpath", (p) => fsc.realpathSync(abs(p))) }),
+      readlinkSync: wrap("readlink", (p) => fsc.readlinkSync(abs(p))),
+      accessSync: wrap("access", (p) => { fsc.statSync(abs(p)); }),
+      openSync: wrap("open", (p, f = "r") => fsc.openSync(abs(p), f)),
+      closeSync: (fd) => fsc.closeSync(fd),
+      readSync: (fd, b, off, len, pos) => (typeof off === "object" && off ? fsc.readSync(fd, b, off.offset || 0, off.length ?? b.length, off.position ?? null) : fsc.readSync(fd, b, off, len, pos)),
+      writeSync: (fd, d, off, len, pos) => { if (typeof d === "string") { const b = Buffer.from(d); return fsc.writeSync(fd, b, 0, b.length, typeof off === "number" ? off : null); } return fsc.writeSync(fd, d, off ?? 0, len ?? d.length - (off ?? 0), pos ?? null); },
+      ftruncateSync: (fd, l) => fsc.ftruncateSync(fd, l), fsyncSync() {}, fdatasyncSync() {},
+      utimesSync: (p, a, m) => fsc.utimesSync(abs(p), +a / 1000 || 0, +m / 1000 || 0),
+      symlinkSync: wrap("symlink", (t, p) => fsc.symlinkSync(t, abs(p))),
+      chmodSync() {}, chownSync() {}, lchownSync() {},
+      mkdtempSync: (prefix) => { const p = abs(prefix + Math.random().toString(36).slice(2, 8)); mkdirp(p); return p; },
+      watch: () => ({ close() {}, on() { return this; } }), watchFile() {}, unwatchFile() {},
+      constants: loadBuiltin("constants"),
+    };
+    s.createWriteStream = (p, o) => {
+      const { Writable } = loadBuiltin("stream");
+      const file = abs(p); const flags = (o && o.flags) || "w";
+      const fd = fsc.openSync(file, flags === "a" ? "a" : "w");
+      const w = new Writable({ write(chunk, e, cb) { try { fsc.writeSync(fd, toBytes(chunk, e), 0, chunk.length, null); cb(); } catch (err) { cb(err); } }, final(cb) { fsc.closeSync(fd); cb(); } });
+      w.path = file; w.bytesWritten = 0; w.close = (cb) => w.end(cb);
+      return w;
+    };
+    s.createReadStream = (p, o) => { const { Readable } = loadBuiltin("stream"); const data = s.readFileSync(p); const r = new Readable({ read() { this.push(data); this.push(null); } }); r.path = abs(p); if (o && o.encoding) r.setEncoding(o.encoding); return r; };
+    const promisifyAll = (names) => Object.fromEntries(names.map((n) => [n, (...a) => new Promise((res, rej) => { try { res(s[n + "Sync"](...a)); } catch (e) { rej(e); } })]));
+    const asyncNames = ["opendir", "readFile", "writeFile", "appendFile", "stat", "lstat", "readdir", "mkdir", "rm", "rmdir", "unlink", "rename", "copyFile", "cp", "realpath", "readlink", "access", "utimes", "symlink", "chmod", "mkdtemp"];
+    s.promises = promisifyAll(asyncNames);
+    s.promises.open = async (p, f) => { const fd = s.openSync(p, f); return { fd, close: async () => s.closeSync(fd), read: async (b, off, len, pos) => ({ bytesRead: s.readSync(fd, b, off, len, pos), buffer: b }), write: async (d) => ({ bytesWritten: s.writeSync(fd, d) }), stat: async () => s.fstatSync(fd), readFile: async (o) => s.readFileSync(p, o), writeFile: async (d) => s.writeFileSync(p, d) }; };
+    s.promises.constants = s.constants;
+    for (const n of asyncNames) s[n] = (...a) => { const cb = typeof a[a.length - 1] === "function" ? a.pop() : null; let r, err = null; try { r = s[n + "Sync"](...a); } catch (e) { err = e; } if (cb) queueMicrotask(() => (n === "exists" ? cb(!err) : cb(err, r))); };
+    s.exists = (p, cb) => queueMicrotask(() => cb(s.existsSync(p)));
+    s.close = (fd, cb) => { fsc.closeSync(fd); cb && queueMicrotask(() => cb(null)); };
+    s.fstat = (fd, o, cb) => { cb = typeof o === "function" ? o : cb; let r, err = null; try { r = s.fstatSync(fd); } catch (e) { err = e; } queueMicrotask(() => cb(err, r)); };
+    s.open = (p, f, m, cb) => { cb = [f, m, cb].find((x) => typeof x === "function"); let r, err = null; try { r = s.openSync(p, typeof f === "string" ? f : "r"); } catch (e) { err = e; } queueMicrotask(() => cb(err, r)); };
+    s.Stats = class {}; s.Dirent = class {};
+    return s;
+  }
+
+  // ---------- globals for loaded code ----------
+  const installGlobals = () => {
+    const { Buffer } = loadBuiltin("buffer");
+    globalThis.Buffer = Buffer; globalThis.process = loadBuiltin("process"); globalThis.global = globalThis;
+    // Node's TextDecoder accepts views over SharedArrayBuffer (N-API buffers point into shared wasm memory);
+    // browsers throw, so copy those first.
+    if (!globalThis.__vvTextDecoder) {
+      globalThis.__vvTextDecoder = true;
+      const decode = TextDecoder.prototype.decode;
+      TextDecoder.prototype.decode = function (input, options) {
+        if (input && typeof SharedArrayBuffer !== "undefined" && input.buffer instanceof SharedArrayBuffer) input = new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice();
+        return decode.call(this, input, options);
+      };
+    }
+    // In Node, console writes to stdout/stderr; in a worker it only reaches DevTools.
+    if (!globalThis.__vvConsole) {
+      globalThis.__vvConsole = true;
+      const { format } = loadBuiltin("util");
+      const toOut = (fd) => (...args) => write(fd, format(...args) + "\n");
+      Object.assign(console, { log: toOut(1), info: toOut(1), debug: toOut(1), warn: toOut(2), error: toOut(2), trace: toOut(2) });
+    }
+    // Node timers return Timeout objects (ref/unref/refresh); browsers return numbers.
+    if (!globalThis.__vvNodeTimers) {
+      globalThis.__vvNodeTimers = true;
+      const [st, ct, si, ci] = [setTimeout, clearTimeout, setInterval, clearInterval].map((f) => f.bind(globalThis));
+      class Timeout {
+        constructor(make, fn, ms, args) { this._make = make; this._fn = fn; this._ms = ms; this._args = args; this._ref = true; this._id = make(fn, ms, ...args); }
+        ref() { this._ref = true; return this; } unref() { this._ref = false; return this; } hasRef() { return this._ref; }
+        refresh() { ct(this._id); this._id = this._make(this._fn, this._ms, ...this._args); return this; }
+        close() { ct(this._id); return this; } [Symbol.toPrimitive]() { return this._id; }
+      }
+      const idOf = (h) => (h && typeof h === "object" && "_id" in h ? h._id : h);
+      globalThis.setTimeout = (fn, ms, ...args) => new Timeout(st, fn, ms, args);
+      globalThis.setInterval = (fn, ms, ...args) => new Timeout(si, fn, ms, args);
+      globalThis.clearTimeout = (h) => ct(idOf(h));
+      globalThis.clearInterval = (h) => ci(idOf(h));
+    }
+    if (!globalThis.setImmediate) {
+      const ch = new MessageChannel(), q = new Map(); let id = 0;
+      ch.port1.onmessage = (e) => { const t = q.get(e.data); if (t) { q.delete(e.data); t.fn(...t.args); } };
+      globalThis.setImmediate = (fn, ...args) => { const i = ++id; q.set(i, { fn, args }); ch.port2.postMessage(i); return { _id: i, ref() { return this; }, unref() { return this; }, hasRef: () => true }; };
+      globalThis.clearImmediate = (h) => h && q.delete(h._id);
+    }
+  };
+
+  return {
+    Module, require: (id, from = join(cwd, "noop.js")) => Module._load(id, new Module(from)), get process() { return loadBuiltin("process"); }, ProcessExit,
+    runMain(file) {
+      installGlobals();
+      const filename = resolve(file, cwd, null);
+      mainModule = new Module(filename); mainModule.id = ".";
+      Module._cache[filename] = mainModule;
+      mainModule.load(filename);
+      return mainModule;
+    },
+    installGlobals,
+    // Workers reuse the globals the main runtime installed.
+    runWorker(file) {
+      const filename = resolve(file, cwd, null);
+      const m = new Module(filename);
+      Module._cache[filename] = m;
+      m.load(filename);
+      return m;
+    },
+  };
+}

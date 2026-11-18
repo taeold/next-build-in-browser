@@ -1,0 +1,7 @@
+{
+"next.config.ts": "import type { NextConfig } from \"next\";\n\nconst nextConfig: NextConfig = {};\n\nexport default nextConfig;\n",
+"package.json": "{\n  \"name\": \"hello-next\",\n  \"private\": true,\n  \"scripts\": { \"build\": \"next build\" },\n  \"dependencies\": { \"next\": \"16.4.0-preview\", \"react\": \"19.3.1\", \"react-dom\": \"19.3.1\" }\n}\n",
+"app/page.tsx": "import Link from \"next/link\";\n\nexport default function Home() {\n  return (\n    <main>\n      <h1>Hello, Next.js</h1>\n      <p>This app was compiled by Turbopack running in a browser tab.</p>\n      <Link href=\"/about\">About</Link>\n    </main>\n  );\n}\n",
+"app/layout.tsx": "export const metadata = { title: \"Hello Next.js\" };\n\nexport default function RootLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <html lang=\"en\">\n      <body style={{ fontFamily: \"system-ui\", margin: 40 }}>{children}</body>\n    </html>\n  );\n}\n",
+"app/about/page.tsx": "export default function About() {\n  return <p>No server touched this build.</p>;\n}\n"
+}

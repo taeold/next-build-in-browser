@@ -1,0 +1,40 @@
+{
+  "commit": "62b2306eaf8a968f79d6faba815398447d41bb29",
+  "examples": [
+    {
+      "name": "radix-ui",
+      "description": "App Router, Radix UI, Tailwind CSS 3",
+      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/radix-ui"
+    },
+    {
+      "name": "with-framer-motion",
+      "description": "Pages Router, Framer Motion page transitions",
+      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/with-framer-motion"
+    },
+    {
+      "name": "image-component",
+      "description": "App Router, next/image",
+      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/image-component"
+    },
+    {
+      "name": "api-routes-apollo-server-and-client",
+      "description": "Pages Router, GraphQL API route with Apollo",
+      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/api-routes-apollo-server-and-client"
+    },
+    {
+      "name": "with-styled-components",
+      "description": "App Router, styled-components",
+      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/with-styled-components"
+    },
+    {
+      "name": "with-sass",
+      "description": "App Router, Sass",
+      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/with-sass"
+    },
+    {
+      "name": "with-redux",
+      "description": "App Router, Redux Toolkit",
+      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/with-redux"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+node_modules/
+# Built by scripts/build-assets.sh
+site/assets/
+site/pkg/*.mjs
+site/pkg/brotli_dec_wasm*
+site/pkg/LICENSE.brotli-dec-wasm
+site/wasm-util.js
+# Firebase CLI cache
+.firebase/
