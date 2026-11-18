@@ -16,9 +16,18 @@ let nextThreadId = 0;
 class ProcessExit extends Error { constructor(code) { super(`process.exit(${code})`); this.code = code; } }
 // `redirects` maps a package name to another specifier or an absolute path (for stand-ins of native packages).
 // `transformEsm(source, filename)` compiles an ES module to CommonJS, so require() of ESM works as in Node 22+.
-export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worker = null, aliases = {}, redirects = {}, transformEsm = null }) {
+import { WASI as WasmUtilWASI } from "/wasm-util.js";
+
+// `spawnWorker(init)` starts a real thread (a Web Worker running node-worker.js) for worker_threads.Worker;
+// `inRealmWorker(filename, options)` picks the workers that run on this thread instead.
+export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worker = null, aliases = {}, redirects = {}, transformEsm = null, spawnWorker = null, inRealmWorker = () => true }) {
   const builtins = new Map();
   const factories = {};
+  // What would keep a Node process alive, shared by every runtime on this thread (they share globals): referenced
+  // timers, immediates, MessagePorts and worker threads. whenIdle() resolves once nothing does.
+  const loop = globalThis.__vvLoop || (globalThis.__vvLoop = { refs: new Set(), listeners: new Set(), setTimeout: null });
+  const hold = (h) => { loop.refs.add(h); };
+  const release = (h) => { if (loop.refs.delete(h)) for (const f of [...loop.listeners]) f(); };
   const builtinSet = new Set(BUILTIN_NAMES);
   const isBuiltin = (id) => builtinSet.has(id.startsWith("node:") ? id.slice(5) : id);
 
@@ -164,7 +173,8 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
   }
   function resolveExports(pkgDir, exportsField, subpath) {
     let map = exportsField;
-    if (typeof map === "string" || Array.isArray(map) || (map && !Object.keys(map).some((k) => k.startsWith(".")))) map = { ".": map };
+    // Shorthand exports (a target or condition map, not subpaths) become { ".": ... }. "imports" keys start with "#".
+    if (typeof map === "string" || Array.isArray(map) || (map && !Object.keys(map).some((k) => k.startsWith(".") || k.startsWith("#")))) map = { ".": map };
     if (map[subpath] !== undefined) { const t = resolveExportsTarget(map[subpath], ""); return t ? join(pkgDir, t) : null; }
     for (const key of Object.keys(map)) {
       const star = key.indexOf("*");
@@ -248,6 +258,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     if (isBuiltin(spec)) { const ex = loadBuiltin(spec); return { ...ex, default: ex }; }
     const filename = resolve(spec, dirname(fromFile), null);
     const ex = Module._load(filename, null);
+    await Module._cache[filename]?.evaluated;
     return ex && ex.__esModule ? { ...ex, default: ex.default ?? ex } : { ...(typeof ex === "object" ? ex : {}), default: ex };
   }
   function isEsmPackage(f) { let d = dirname(f); for (;;) { const pkg = readPkg(d); if (pkg) return pkg.type === "module"; if (d === "/") return false; d = dirname(d); } }
@@ -255,20 +266,33 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
   const isEsmFile = (f) => f.endsWith(".mjs") || (f.endsWith(".js") && isEsmPackage(f));
   function compileModule(m, content, filename) {
     if (content.startsWith("#!")) content = "//" + content.slice(2);
-    if (transformEsm && isEsmFile(filename)) {
-      content = content
-        .replace(/\bimport\.meta\.url\b/g, 'require("url").pathToFileURL(__filename).href')
-        .replace(/\bimport\.meta\.dirname\b/g, "__dirname")
-        .replace(/\bimport\.meta\.filename\b/g, "__filename");
-      content = transformEsm(content, filename);
-    }
+    // SWC's CommonJS transform also rewrites import.meta (dirname, filename, resolve). Its import.meta.url reads
+    // __filename, which an ES module may declare itself, so that one reads __vv_url instead.
+    const esm = Boolean(transformEsm && isEsmFile(filename));
+    // Bun's import.meta.require has no CommonJS form in SWC; packages only reach it under Bun, so it maps to require.
+    if (esm) content = transformEsm(content, filename).replaceAll('require("url").pathToFileURL(__filename).toString()', "__vv_url").replaceAll("import.meta.require(", "require(");
     const src = content.replace(/(^|[^.\w$])import\(/g, "$1__vv_import(");
-    let wrapper;
-    try { wrapper = (0, eval)(`(function (exports, require, module, __filename, __dirname, __vv_import) {${src}\n})\n//# sourceURL=file://${filename}`); }
-    catch (e) { if (e instanceof SyntaxError) e.message += ` (in ${filename})`; throw e; }
+    // An ES module with top-level await runs in an async wrapper; import() waits for it (m.evaluated). Node refuses
+    // require() of such modules, so nothing synchronous depends on them finishing.
+    // An ES module runs one scope deeper, so its own __dirname or __filename shadows the wrapper's instead of
+    // colliding with it.
+    const compile = (prefix) => (0, eval)(esm
+      ? `(function (exports, require, module, __filename, __dirname, __vv_import, __vv_url) { return (${prefix}function () {${src}\n})(); })\n//# sourceURL=file://${filename}`
+      : `(${prefix}function (exports, require, module, __filename, __dirname, __vv_import) {${src}\n})\n//# sourceURL=file://${filename}`);
+    let wrapper, isAsync = false;
+    try {
+      try { wrapper = compile(""); }
+      catch (e) {
+        if (!(e instanceof SyntaxError && /await is only valid/.test(e.message))) throw e;
+        wrapper = compile("async ");
+        isAsync = true;
+      }
+    } catch (e) { throw e instanceof SyntaxError ? new SyntaxError(`${e.message} (in ${filename})`) : e; }
     const req = makeRequire(m);
     m.require = (id) => Module._load(id, m, false);
-    return wrapper.call(m.exports, m.exports, req, m, filename, dirname(filename), (s) => dynamicImport(String(s), filename));
+    const result = wrapper.call(m.exports, m.exports, req, m, filename, dirname(filename), (s) => dynamicImport(String(s), filename), "file://" + encodeURI(filename));
+    if (isAsync) m.evaluated = result;
+    return result;
   }
 
   // ---------- built-ins ----------
@@ -287,14 +311,31 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
 
   Object.assign(factories, {
     events: () => { const ev = poly("events"); EventEmitter = ev; ev.EventEmitter = ev; ev.setMaxListeners = ev.setMaxListeners || (() => {}); ev.getEventListeners = (e, n) => e.listeners(n); return ev; },
-    buffer: () => { const b = poly("buffer"); b.constants = { MAX_LENGTH: b.kMaxLength, MAX_STRING_LENGTH: 2 ** 29 }; b.isUtf8 = () => true; return b; },
+    buffer: () => {
+      const b = poly("buffer"); b.constants = { MAX_LENGTH: b.kMaxLength, MAX_STRING_LENGTH: 2 ** 29 }; b.isUtf8 = () => true;
+      // The polyfill predates Node's base64url encoding; it is base64 with -_ and no padding.
+      const B = b.Buffer, from = B.from, toString = B.prototype.toString, isEncoding = B.isEncoding;
+      B.from = function (value, enc, ...rest) {
+        if (typeof value === "string" && String(enc).toLowerCase() === "base64url") return from.call(this, value.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+        return from.call(this, value, enc, ...rest);
+      };
+      B.prototype.toString = function (enc, ...rest) {
+        if (String(enc).toLowerCase() === "base64url") return toString.call(this, "base64", ...rest).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+        return toString.call(this, enc, ...rest);
+      };
+      B.isEncoding = (enc) => String(enc).toLowerCase() === "base64url" || isEncoding(enc);
+      return b;
+    },
     util: () => {
       const u = poly("util");
       u.types = Object.assign({}, u.types || {}, { isPromise: (v) => v instanceof Promise, isRegExp: (v) => v instanceof RegExp, isDate: (v) => v instanceof Date, isNativeError: (v) => v instanceof Error, isAnyArrayBuffer: (v) => v instanceof ArrayBuffer || v instanceof SharedArrayBuffer, isUint8Array: (v) => v instanceof Uint8Array, isProxy: () => false, isAsyncFunction: (f) => f && f.constructor && f.constructor.name === "AsyncFunction", isGeneratorFunction: (f) => f && f.constructor && /GeneratorFunction/.test(f.constructor.name) });
       u.TextEncoder = TextEncoder; u.TextDecoder = TextDecoder;
       u.stripVTControlCharacters = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
       u.styleText = (_f, s) => s; u.parseArgs = undefined; u.getSystemErrorName = (c) => String(c); u.isDeepStrictEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-      u.inspect = u.inspect || ((v) => String(v)); if (!u.inspect.custom) u.inspect.custom = Symbol.for("nodejs.util.inspect.custom");
+      // Like Node, an Error inspects as its stack.
+      const inspect = u.inspect || ((v) => String(v));
+      u.inspect = Object.assign((v, ...rest) => (v instanceof Error && v.stack ? v.stack : inspect(v, ...rest)), inspect);
+      if (!u.inspect.custom) u.inspect.custom = Symbol.for("nodejs.util.inspect.custom");
       u.debuglog = () => Object.assign(() => {}, { enabled: false });
       return u;
     },
@@ -362,11 +403,50 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     dns: () => ({ lookup: (_h, _o, cb) => (cb || _o)(new Error("dns unavailable")), promises: { lookup: async () => { throw new Error("dns unavailable"); } } }),
     "dns/promises": () => loadBuiltin("dns").promises,
     inspector: () => ({ url: () => undefined, open() {}, close() {}, Session: class { connect() {} post() {} disconnect() {} } }),
-    wasi: () => ({ WASI: stubClass("node:wasi") }),
+    // Node's WASI class on @tybys/wasm-util, over this runtime's file system.
+    wasi: () => ({
+      WASI: class WASI {
+        constructor(o = {}) {
+          this._wasi = new WasmUtilWASI({ version: o.version || "preview1", args: o.args, env: o.env, preopens: o.preopens, fs: fsc, returnOnExit: o.returnOnExit ?? true });
+          this.wasiImport = this._wasi.wasiImport;
+        }
+        getImportObject() { return this._wasi.getImportObject(); }
+        start(instance) { return this._wasi.start(instance); }
+        initialize(instance) { return this._wasi.initialize(instance); }
+      },
+    }),
   });
 
-  // Turbopack's loader workers (PostCSS and friends) talk to the binding only through async calls, so they can run
-  // on this thread: each Worker gets a child runtime with its own module cache, sharing files and the binding.
+  // A real thread has no compiler, so this thread compiles every ES module the thread will load, found by following
+  // string-literal require() calls from its entry (after compilation, imports are require() calls too). Cached per
+  // entry: each wasm thread of a binding starts from the same entry.
+  const threadGraphs = new Map();
+  function compileThreadGraph(entry) {
+    if (!transformEsm) return {};
+    if (threadGraphs.has(entry)) return threadGraphs.get(entry);
+    const transformed = {}, seen = new Set(), todo = [entry];
+    while (todo.length) {
+      const file = todo.pop();
+      if (seen.has(file) || !/\.[cm]?js$/.test(file)) continue;
+      seen.add(file);
+      let code = readText(file);
+      if (isEsmFile(file)) transformed[file] = code = transformEsm(code, file);
+      // Also renamed requires: SWC turns a module's own `const require = createRequire(...)` into require1.
+      for (const [, , spec] of code.matchAll(/require\w*\(\s*(["'])([^"'\n]+)\1\s*\)/g)) {
+        let request = spec;
+        for (const [from, to] of Object.entries(redirects)) if (request === from || request.startsWith(from + "/")) { request = to + request.slice(from.length); break; }
+        if (isBuiltin(request) || Object.prototype.hasOwnProperty.call(aliases, request)) continue;
+        try { const target = resolve(request, dirname(file), null); if (!isBuiltin(target)) todo.push(target); } catch {}
+      }
+    }
+    threadGraphs.set(entry, transformed);
+    return transformed;
+  }
+
+  // A Worker is a real thread (spawnWorker) unless inRealmWorker says otherwise. Turbopack's loader workers talk to
+  // the binding only through async calls, so they run on this thread: a child runtime with its own module cache,
+  // sharing files and the binding. A real thread gets its own runtime; this thread compiles its entry if it is an
+  // ES module, since the compiler (SWC in the binding) lives here.
   function makeWorkerThreads() {
     const EE = loadBuiltin("events");
     const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
@@ -375,8 +455,9 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
         super();
         this.threadId = ++nextThreadId;
         const filename = String(file).startsWith("file:") ? decodeURIComponent(new URL(String(file)).pathname) : String(file);
+        if (spawnWorker && !inRealmWorker(filename, opts)) { this._startThread(filename, opts); return; }
         const child = createRuntime({
-          fs: fsc, cwd, polyfills, write, aliases, redirects, transformEsm,
+          fs: fsc, cwd, polyfills, write, aliases, redirects, transformEsm, spawnWorker, inRealmWorker,
           env: opts.env && opts.env !== SHARE_ENV ? { ...opts.env } : env,
           argv: [argv[0], filename, ...(opts.argv || []).map(String)],
           worker: { workerData: opts.workerData === undefined ? null : opts.workerData, threadId: this.threadId },
@@ -386,12 +467,43 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
           catch (e) { this.emit("error", e); this.emit("exit", 1); }
         }, 0);
       }
-      postMessage() {}
-      ref() { return this; }
-      unref() { return this; }
-      terminate() { setTimeout(() => this.emit("exit", 1), 0); return Promise.resolve(1); }
+      _startThread(filename, opts) {
+        const transformed = compileThreadGraph(filename);
+        const thread = spawnWorker({
+          filename, transformed, threadId: this.threadId,
+          env: opts.env && opts.env !== SHARE_ENV ? { ...opts.env } : { ...loadBuiltin("process").env },
+          argv: [argv[0], filename, ...(opts.argv || []).map(String)],
+          workerData: opts.workerData === undefined ? null : opts.workerData,
+        });
+        this._thread = thread;
+        hold(this);
+        thread.onmessage = (e) => {
+          const d = e.data;
+          if (d && d.__nodeStdio) return write(d.__nodeStdio[0], d.__nodeStdio[1]);
+          if (d && d.__nodeExit !== undefined) { this._thread = null; thread.terminate(); release(this); return this.emit("exit", d.__nodeExit); }
+          this.emit("message", d);
+        };
+        thread.onerror = (e) => { e.preventDefault(); this.emit("error", e.error || new Error(e.message)); };
+        setTimeout(() => this.emit("online"), 0);
+      }
+      postMessage(message, transfer) { if (this._thread) this._thread.postMessage(message, transfer); }
+      ref() { if (this._thread) hold(this); return this; }
+      unref() { release(this); return this; }
+      terminate() {
+        if (this._thread) { this._thread.terminate(); this._thread = null; }
+        release(this);
+        setTimeout(() => this.emit("exit", 1), 0);
+        return Promise.resolve(1);
+      }
     }
-    const parentPort = worker ? Object.assign(new EE(), { postMessage() {}, close() {}, start() {}, ref() {}, unref() {} }) : null;
+    // In a real thread, parentPort is the Web Worker's own message channel to its parent.
+    const parentPort = !worker ? null : worker.port
+      ? (() => {
+          const port = Object.assign(new EE(), { postMessage: (m, t) => worker.port.postMessage(m, t), close() {}, start() {}, ref() {}, unref() {} });
+          worker.port.addEventListener("message", (e) => port.emit("message", e.data));
+          return port;
+        })()
+      : Object.assign(new EE(), { postMessage() {}, close() {}, start() {}, ref() {}, unref() {} });
     return {
       isMainThread: !worker, parentPort, workerData: worker ? worker.workerData : null, threadId: worker ? worker.threadId : 0,
       resourceLimits: {}, Worker, MessageChannel, MessagePort, BroadcastChannel, SHARE_ENV,
@@ -535,27 +647,46 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       const toOut = (fd) => (...args) => write(fd, format(...args) + "\n");
       Object.assign(console, { log: toOut(1), info: toOut(1), debug: toOut(1), warn: toOut(2), error: toOut(2), trace: toOut(2) });
     }
-    // Node timers return Timeout objects (ref/unref/refresh); browsers return numbers.
+    // Node timers return Timeout objects (ref/unref/refresh); browsers return numbers. Referenced timers, immediates
+    // and MessagePorts hold the event loop open (see `loop`).
     if (!globalThis.__vvNodeTimers) {
       globalThis.__vvNodeTimers = true;
       const [st, ct, si, ci] = [setTimeout, clearTimeout, setInterval, clearInterval].map((f) => f.bind(globalThis));
+      loop.setTimeout = st;
+      const byId = new Map();
       class Timeout {
-        constructor(make, fn, ms, args) { this._make = make; this._fn = fn; this._ms = ms; this._args = args; this._ref = true; this._id = make(fn, ms, ...args); }
-        ref() { this._ref = true; return this; } unref() { this._ref = false; return this; } hasRef() { return this._ref; }
-        refresh() { ct(this._id); this._id = this._make(this._fn, this._ms, ...this._args); return this; }
-        close() { ct(this._id); return this; } [Symbol.toPrimitive]() { return this._id; }
+        constructor(make, fn, ms, args) {
+          this._make = make; this._ms = ms; this._args = args; this._ref = true; this._repeat = make === si;
+          this._fn = this._repeat ? fn : (...a) => { this._stop(); fn(...a); };
+          this._start();
+        }
+        _start() { this._id = this._make(this._fn, this._ms, ...this._args); byId.set(this._id, this); this._active = true; if (this._ref) hold(this); }
+        _stop() { byId.delete(this._id); this._active = false; release(this); }
+        ref() { this._ref = true; if (this._active) hold(this); return this; }
+        unref() { this._ref = false; release(this); return this; }
+        hasRef() { return this._ref; }
+        refresh() { ct(this._id); byId.delete(this._id); this._start(); return this; }
+        close() { ct(this._id); this._stop(); return this; } [Symbol.toPrimitive]() { return this._id; }
       }
-      const idOf = (h) => (h && typeof h === "object" && "_id" in h ? h._id : h);
+      const clear = (h) => { const t = h && typeof h === "object" ? h : byId.get(h); if (t instanceof Timeout) t.close(); else if (h != null) ct(h); };
       globalThis.setTimeout = (fn, ms, ...args) => new Timeout(st, fn, ms, args);
       globalThis.setInterval = (fn, ms, ...args) => new Timeout(si, fn, ms, args);
-      globalThis.clearTimeout = (h) => ct(idOf(h));
-      globalThis.clearInterval = (h) => ci(idOf(h));
+      globalThis.clearTimeout = clear;
+      globalThis.clearInterval = clear;
     }
     if (!globalThis.setImmediate) {
       const ch = new MessageChannel(), q = new Map(); let id = 0;
-      ch.port1.onmessage = (e) => { const t = q.get(e.data); if (t) { q.delete(e.data); t.fn(...t.args); } };
-      globalThis.setImmediate = (fn, ...args) => { const i = ++id; q.set(i, { fn, args }); ch.port2.postMessage(i); return { _id: i, ref() { return this; }, unref() { return this; }, hasRef: () => true }; };
-      globalThis.clearImmediate = (h) => h && q.delete(h._id);
+      ch.port1.onmessage = (e) => { const t = q.get(e.data); if (t) { q.delete(e.data); release(t.handle); t.fn(...t.args); } };
+      globalThis.setImmediate = (fn, ...args) => {
+        const i = ++id, handle = { _id: i, ref() { return this; }, unref() { release(this); return this; }, hasRef: () => true };
+        q.set(i, { fn, args, handle }); hold(handle); ch.port2.postMessage(i); return handle;
+      };
+      globalThis.clearImmediate = (h) => { if (h && q.delete(h._id)) release(h); };
+    }
+    // Node's MessagePort has ref()/unref(); emnapi refs one while native async work is pending.
+    if (typeof MessagePort !== "undefined" && !("ref" in MessagePort.prototype)) {
+      MessagePort.prototype.ref = function () { hold(this); return this; };
+      MessagePort.prototype.unref = function () { release(this); return this; };
     }
   };
 
@@ -570,6 +701,26 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       return mainModule;
     },
     installGlobals,
+    // Resolves with the exit code once nothing holds the event loop open, after emitting 'beforeExit' (which may
+    // schedule more work), the way a Node process ends without process.exit().
+    whenIdle() {
+      return new Promise((resolve) => {
+        let scheduled = false;
+        const check = () => {
+          if (scheduled) return;
+          scheduled = true;
+          loop.setTimeout(() => {
+            scheduled = false;
+            if (loop.refs.size) return;
+            const p = loadBuiltin("process");
+            p.emit("beforeExit", p.exitCode ?? 0);
+            loop.setTimeout(() => { if (loop.refs.size) return; loop.listeners.delete(check); resolve(p.exitCode ?? 0); }, 0);
+          }, 0);
+        };
+        loop.listeners.add(check);
+        check();
+      });
+    },
     // Workers reuse the globals the main runtime installed.
     runWorker(file) {
       const filename = resolve(file, cwd, null);

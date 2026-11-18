@@ -16,7 +16,7 @@ const root = path.resolve(new URL("..", import.meta.url).pathname);
 const apps = args.filter((a) => a !== "--deploy");
 if (!apps.length) {
   const gallery = JSON.parse(fs.readFileSync(path.join(root, "site/examples/index.json"), "utf8"));
-  apps.push("sample", path.join(root, "fixtures/tailwind"), path.join(root, "fixtures/npm-deps"), ...gallery.examples.map((e) => `example:${e.name}`));
+  apps.push("sample", path.join(root, "fixtures/tailwind"), path.join(root, "fixtures/npm-deps"), path.join(root, "fixtures/vite-react"), ...gallery.examples.map((e) => `example:${e.name}`));
 }
 
 const browser = await chromium.launch(process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {});

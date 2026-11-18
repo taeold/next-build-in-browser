@@ -1,6 +1,6 @@
 // Runs the real `next build --wasi --experimental-build-mode compile` in this worker: Next's own JS on the small
 // runtime in node/runtime.js, Turbopack + SWC from the wasm binding instantiated here.
-import { createFsClient } from "./fs-client.js";
+import { createFsClient, portsForChild } from "./fs-client.js";
 import { createBinding } from "./binding.js";
 import { createRuntime } from "./node/runtime.js";
 import { getDefaultContext } from "/pkg/emnapi-runtime.mjs";
@@ -35,26 +35,45 @@ self.onmessage = async ({ data }) => {
     let i;
     while ((i = stdoutBuf.indexOf("\n")) >= 0) { post("out", stdoutBuf.slice(0, i).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")); stdoutBuf = stdoutBuf.slice(i + 1); }
   };
+  const redirects = { lightningcss: "lightningcss-wasm", "@tailwindcss/oxide": "/polyfills/node_modules/@vv/tailwind-oxide-js/index.js" };
   const rt = createRuntime({
     fs: fsClient, cwd: data.appDir, polyfills: data.polyfills, write,
     // Next hands loader workers the binding's package name as bindingPath; give them the instance already running.
     aliases: { "@next/swc-wasm-wasi": exports },
     // Native packages Tailwind needs: lightningcss has an official wasm build; oxide gets a JS scanner (see the file).
-    redirects: { lightningcss: "lightningcss-wasm", "@tailwindcss/oxide": "/polyfills/node_modules/@vv/tailwind-oxide-js/index.js" },
+    redirects,
+    // worker_threads get real threads (node-worker.js), except Turbopack's loader workers: they share the binding
+    // running on this thread.
+    spawnWorker: (init) => {
+      const thread = new Worker(new URL("./node-worker.js", import.meta.url), { type: "module", name: "node-worker" });
+      const [fsPort, regPort] = portsForChild(fsClient);
+      thread.postMessage({ nodeWorker: { ...init, fsPort, regPort, cwd: data.appDir, polyfills: data.polyfills, redirects } }, [fsPort, regPort]);
+      return thread;
+    },
+    inRealmWorker: (_filename, options) => options?.workerData?.bindingPath === "@next/swc-wasm-wasi",
     // require() of an ES module (Node 22+), compiled to CommonJS by the SWC already in the binding.
     transformEsm: (source, filename) => exports.transformSync(source, false, globalThis.Buffer.from(JSON.stringify({
       filename, isModule: true, sourceMaps: false,
       jsc: { parser: { syntax: "ecmascript", importAttributes: true }, target: "es2022" },
-      module: { type: "commonjs", importInterop: "node" },
+      // "swc" interop honors __esModule, so a default import of another compiled ES module gets its default export.
+      module: { type: "commonjs", importInterop: "swc" },
     }))).code,
     env: { HOME: "/home/user", PATH: "/usr/bin", NEXT_TELEMETRY_DISABLED: "1", TURBO_TASKS_AVAILABLE_PARALLELISM: String(data.parallelism), ...data.env },
-    argv: ["/usr/bin/node", data.appDir + "/node_modules/next/dist/bin/next", ...data.args],
+    argv: ["/usr/bin/node", data.appDir + "/" + (data.bin || "node_modules/next/dist/bin/next"), ...data.args],
   });
 
   // emnapi captured Buffer when its context was created, before the runtime installed the polyfill; Turbopack's loader
   // workers exchange messages as Buffers.
   rt.installGlobals();
-  getDefaultContext().features.Buffer = globalThis.Buffer;
+  const napiContext = getDefaultContext();
+  napiContext.features.Buffer = globalThis.Buffer;
+  // emnapi holds Node's event loop open while native async work is pending, but only builds that hold when process
+  // existed as the binding loaded, which it did not here. The same counter, on a MessagePort the runtime tracks.
+  if (!napiContext.refCounter) {
+    const port = new MessageChannel().port1;
+    let pending = 0;
+    napiContext.refCounter = { increase() { if (pending++ === 0) port.ref(); }, decrease() { if (pending > 0 && --pending === 0) port.unref(); } };
+  }
 
   let finished = false;
   const finish = (code, error) => {
@@ -72,7 +91,7 @@ self.onmessage = async ({ data }) => {
         else outputs.push([p, fsClient.statSync(p).size]);
       }
     };
-    try { walk(data.appDir + "/.next"); } catch {}
+    try { walk(data.appDir + "/" + (data.outDir || ".next")); } catch {}
     log(`next exited with code ${code}; .next holds ${outputs.length} files; ${threadCount()} wasm threads`);
     // Hand .next to the page for display and download.
     const blobs = outputs.map(([p, , link]) => (link ? new TextEncoder().encode(link) : fsClient.readFileBytes(p)));
@@ -88,9 +107,11 @@ self.onmessage = async ({ data }) => {
   self.addEventListener("error", (ev) => { ev.preventDefault(); onFailure(ev.error); });
 
   const tStart = performance.now();
-  log("running next", data.args.join(" "));
+  log("running", data.bin || "next", data.args.join(" "));
   try {
-    rt.runMain(data.appDir + "/node_modules/next/dist/bin/next");
+    rt.runMain(data.appDir + "/" + (data.bin || "node_modules/next/dist/bin/next"));
+    // A CLI that returns without process.exit() ends, as in Node, when nothing holds the event loop open.
+    rt.whenIdle().then((code) => { rt.process.emit("exit", code); finish(code); });
   } catch (e) {
     onFailure(e);
   }

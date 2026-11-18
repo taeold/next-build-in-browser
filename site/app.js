@@ -96,12 +96,19 @@ function rootAt(files) {
   const dir = pkgs[0].slice(0, -"package.json".length);
   return files.filter(([p]) => p.startsWith(dir)).map(([p, b]) => [p.slice(dir.length), b]);
 }
+// How to build each supported framework: the CLI to run (relative to the app), its arguments, and where output lands.
+const FRAMEWORKS = [
+// `output` says how the output deploys (deploy.js): "next" is a standalone server plus static files, "static" is files.
+  { name: "next", detect: (deps) => deps.next, bin: "node_modules/next/dist/bin/next", args: ["build", "--wasi", "--experimental-build-mode", "compile"], env: { NEXT_PRIVATE_STANDALONE: "1" }, outDir: ".next", output: "next" },
+  { name: "vite", detect: (deps) => deps.vite, bin: "node_modules/vite/bin/vite.js", args: ["build"], env: {}, outDir: "dist", output: "static" },
+];
 function checkApp(files) {
   const pkg = JSON.parse(new TextDecoder().decode(files.find(([p]) => p === "package.json")[1]));
   const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-  if (!deps.next) throw new Error("package.json does not depend on next");
-  if (!files.some(([p]) => /^(src\/)?(app|pages)\//.test(p))) throw new Error("no app/ or pages/ directory");
-  return pkg.name || "app";
+  const framework = FRAMEWORKS.find((f) => f.detect(deps));
+  if (!framework) throw new Error("no supported framework in package.json (next or vite)");
+  if (framework.name === "next" && !files.some(([p]) => /^(src\/)?(app|pages)\//.test(p))) throw new Error("no app/ or pages/ directory");
+  return { name: pkg.name || "app", framework };
 }
 
 // ---------- npm install (in a worker, straight into the in-tab file system) ----------
@@ -130,7 +137,7 @@ function npmInstall(files) {
 }
 
 // ---------- build ----------
-let app = null, dotNext = [], buildId = "", buildSeconds = 0, busy = false;
+let app = null, output = [], buildId = "", buildSeconds = 0, busy = false;
 async function build(files, label, title) {
   if (busy) return;
   busy = true;
@@ -138,9 +145,9 @@ async function build(files, label, title) {
   actions([]);
   try {
     files = rootAt(files);
-    const packageName = checkApp(files);
+    const { name: packageName, framework } = checkApp(files);
     const name = title || packageName;
-    app = { files, name };
+    app = { files, name, framework };
     print(`<span class="faint">${esc(label)}:</span> ${esc(name)} <span class="faint">(${files.length} files)</span>`);
     await fsReady;
     const scanner = new Uint8Array(await (await fetch("/node/tailwind-oxide-js.cjs")).arrayBuffer());
@@ -151,8 +158,8 @@ async function build(files, label, title) {
     });
     await npmInstall(files);
     await bindingReady;
-    print("<b>$ next build --wasi --experimental-build-mode compile</b>");
-    host.postMessage({ type: "run", appDir: "/app", polyfills: "/polyfills/node_modules", parallelism: 2, args: ["build", "--wasi", "--experimental-build-mode", "compile"], env: { NEXT_PRIVATE_STANDALONE: "1" } });
+    print(`<b>$ ${esc(framework.name)} ${esc(framework.args.join(" "))}</b>`);
+    host.postMessage({ type: "run", appDir: "/app", polyfills: "/polyfills/node_modules", parallelism: 2, bin: framework.bin, args: framework.args, env: framework.env, outDir: framework.outDir });
   } catch (e) {
     say(String(e.message || e), "bad");
     running(null);
@@ -164,7 +171,7 @@ async function build(files, label, title) {
 host.addEventListener("message", ({ data }) => {
   if (data.type === "out") say(data.text, /✓/.test(data.text) ? "ok" : /rror/.test(data.text) ? "bad" : "");
   if (data.type === "log" && /uncaught|failed/i.test(data.text)) say(data.text.replace(/^\[host \+[\d.]+s\] /, ""), "bad");
-  if (data.type === "dotnext") dotNext = data.files;
+  if (data.type === "dotnext") output = data.files;
   if (data.type !== "done") return;
   running(null);
   // The build is over and the next one reloads the page, so free the wasm memory, its threads and the file
@@ -177,10 +184,12 @@ host.addEventListener("message", ({ data }) => {
     return;
   }
   buildSeconds = data.buildSeconds;
-  buildId = new TextDecoder().decode((dotNext.find(([p]) => p === ".next/BUILD_ID") || [, new Uint8Array()])[1]).trim();
-  const bytes = dotNext.reduce((s, [, b]) => s + b.length, 0);
-  print(`<span class="ok">done in ${buildSeconds.toFixed(1)}s</span> <span class="faint">· .next ${dotNext.length} files · ${mib(bytes)} · build id ${esc(buildId)}</span>`);
-  actions([["deploy", deploy, "▲"], ["download .next", download], again]);
+  // Next.js writes a build ID; for other builds the tab makes one, so the deployment's proof still names this build.
+  const nextBuildId = output.find(([p]) => p === ".next/BUILD_ID");
+  buildId = nextBuildId ? new TextDecoder().decode(nextBuildId[1]).trim() : crypto.randomUUID().slice(0, 8);
+  const bytes = output.reduce((s, [, b]) => s + b.length, 0);
+  print(`<span class="ok">done in ${buildSeconds.toFixed(1)}s</span> <span class="faint">· ${esc(app.framework.outDir)} ${output.length} files · ${mib(bytes)} · build id ${esc(buildId)}</span>`);
+  actions([["deploy", deploy, "▲"], [`download ${app.framework.outDir}`, download], again]);
 });
 
 // ---------- deploy (temporary, prebuilt) ----------
@@ -190,18 +199,18 @@ async function deploy() {
   let live = null;
   const out = { line: (text) => { live = null; say(text, "faint"); }, progress: (text) => { (live ||= print("", "faint")).textContent = text; } };
   try {
-    const proof = { builtInBrowser: true, buildId, buildSeconds: Number(buildSeconds.toFixed(1)), builtAt: new Date().toISOString(), command: "next build --wasi --experimental-build-mode compile", buildPage: location.origin, userAgent: navigator.userAgent };
-    const result = await deployPrebuilt(toBuildOutput(dotNext, app.files, proof), out);
+    const proof = { builtInBrowser: true, buildId, buildSeconds: Number(buildSeconds.toFixed(1)), builtAt: new Date().toISOString(), command: `${app.framework.name} ${app.framework.args.join(" ")}`, buildPage: location.origin, userAgent: navigator.userAgent };
+    const result = await deployPrebuilt(toBuildOutput(app.framework, output, app.files, proof), out);
     const minutes = Math.max(0, Math.round((result.expiresAt - Date.now()) / 60000));
     print(`<span class="faint">proof</span> <a href="${result.url}/built-in-browser.json" target="_blank" rel="noopener">/built-in-browser.json</a> <span class="faint">→ build id ${esc(buildId)}</span>`);
     print(`<span class="faint">expires in ${minutes} min ·</span> <a href="${result.claimUrl}" target="_blank" rel="noopener">claim it</a> <span class="faint">(private link)</span>`);
     print(`<span class="ok">deployed</span> <a href="${result.url}" target="_blank" rel="noopener">${esc(result.url)}</a>`);
-    actions([["download .next", download], again]);
+    actions([[`download ${app.framework.outDir}`, download], again]);
     running(null);
   } catch (e) {
     say(`deploy failed: ${e.message || e}`, "bad");
     running(null);
-    actions([["deploy", deploy, "▲"], ["download .next", download], again]);
+    actions([["deploy", deploy, "▲"], [`download ${app.framework.outDir}`, download], again]);
   }
 }
 
@@ -225,8 +234,8 @@ function tar(files) {
   return new Blob(parts);
 }
 async function download() {
-  const gz = await new Response(tar(dotNext).stream().pipeThrough(new CompressionStream("gzip"))).blob();
-  Object.assign(document.createElement("a"), { href: URL.createObjectURL(gz), download: "next-build.tar.gz" }).click();
+  const gz = await new Response(tar(output).stream().pipeThrough(new CompressionStream("gzip"))).blob();
+  Object.assign(document.createElement("a"), { href: URL.createObjectURL(gz), download: `${app.framework.name}-build.tar.gz` }).click();
 }
 
 // ---------- inputs ----------

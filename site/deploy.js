@@ -13,8 +13,21 @@ const handle = app.getRequestHandler();
 module.exports = async (req, res) => { await ready; return handle(req, res); };
 `;
 
+export function toBuildOutput(framework, files, appFiles, proof) {
+  return framework.output === "static" ? staticOutput(framework.outDir, files, proof) : nextOutput(files, appFiles, proof);
+}
+
+// Build Output API v3 for a static site: the output directory as static files, served as they are.
+function staticOutput(outDir, files, proof) {
+  const enc = new TextEncoder(), out = new Map();
+  for (const [p, bytes, link] of files) if (p.startsWith(outDir + "/") && !link) out.set("static/" + p.slice(outDir.length + 1), [bytes, 0o100644]);
+  out.set("static/built-in-browser.json", [enc.encode(JSON.stringify(proof, null, 2)), 0o100644]);
+  out.set("config.json", [enc.encode(JSON.stringify({ version: 3, routes: [{ handle: "filesystem" }] })), 0o100644]);
+  return out;
+}
+
 // Build Output API v3: the standalone server as one Node function, .next/static and public/ as static files.
-export function toBuildOutput(dotNext, appFiles, proof) {
+function nextOutput(dotNext, appFiles, proof) {
   // Values are [bytes, mode]; a symlink is uploaded as its target path with the symlink mode, like the Vercel CLI.
   const enc = new TextEncoder(), out = new Map();
   const FILE = 0o100644, LINK = 0o120777;
@@ -110,6 +123,11 @@ export async function deployPrebuilt(output, out) {
   await streamLog();
   if (dep.readyState !== "READY") throw new Error(`Deployment ended in state ${dep.readyState}`);
   // The temporary *.tmp.now alias is public; *.vercel.app aliases of an anonymous deployment sit behind Vercel login.
+  // A fast deployment can be READY before Vercel attaches the tmp.now alias, so wait a little for it.
+  for (let i = 0; i < 20 && !(dep.alias || []).some((a) => a.endsWith(".tmp.now")); i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    dep = await api(`/v13/deployments/${dep.id}`, { token });
+  }
   const alias = (dep.alias || []).find((a) => a.endsWith(".tmp.now")) || (dep.alias || []).find((a) => a.endsWith(".vercel.app")) || dep.alias?.[0];
   return { url: "https://" + (alias || dep.url), deploymentUrl: "https://" + dep.url, inspectorUrl: dep.inspectorUrl, claimUrl, expiresAt, deploymentId: dep.id };
 }
