@@ -67,26 +67,33 @@ export async function deployPrebuilt(output, onProgress) {
   onProgress("creating a temporary vercel project");
   const { token, projectId: project, claimUrl, expiresAt } = await api("/v1/anonymous/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 
-  const entries = [...output];
-  const files = [];
-  let done = 0;
-  const queue = entries.slice();
-  const worker = async () => {
-    for (let e; (e = queue.shift()); ) {
-      const [path, [bytes, mode]] = e;
-      const sha = await sha1(bytes);
-      await api("/v2/files", { token, method: "POST", headers: { "Content-Type": "application/octet-stream", "x-vercel-digest": sha }, body: bytes });
-      files.push({ file: ".vercel/output/" + path, sha, size: bytes.length, mode });
-      onProgress(`uploading ${++done}/${entries.length} files`);
-    }
-  };
-  await Promise.all(Array.from({ length: 8 }, worker));
-
-  onProgress("creating the deployment (prebuilt, vercel runs no build)");
-  let dep = await api("/v13/deployments?skipAutoDetectionConfirmation=1&prebuilt=1", {
+  // Like the Vercel CLI: describe every file by hash, and upload only the ones Vercel says it doesn't have yet.
+  // Next.js's server runtime is the same in every deployment, so usually only the app's own files are new.
+  onProgress("hashing the output");
+  const files = await Promise.all([...output].map(async ([path, [bytes, mode]]) => ({ file: ".vercel/output/" + path, sha: await sha1(bytes), size: bytes.length, mode, bytes })));
+  const create = () => api("/v13/deployments?skipAutoDetectionConfirmation=1&prebuilt=1", {
     token, method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: project, project, target: "production", version: 2, files, projectSettings: { framework: null, sourceFilesOutsideRootDirectory: true } }),
+    body: JSON.stringify({ name: project, project, target: "production", version: 2, files: files.map(({ bytes, ...f }) => f), projectSettings: { framework: null, sourceFilesOutsideRootDirectory: true } }),
   });
+  onProgress("creating the deployment (prebuilt, vercel runs no build)");
+  let dep;
+  try {
+    dep = await create();
+  } catch (e) {
+    if (e.body?.error?.code !== "missing_files") throw e;
+    const missing = new Set(e.body.error.missing);
+    const queue = [...new Map(files.filter((f) => missing.has(f.sha)).map((f) => [f.sha, f])).values()];
+    const total = queue.length;
+    let done = 0;
+    const worker = async () => {
+      for (let f; (f = queue.shift()); ) {
+        await api("/v2/files", { token, method: "POST", headers: { "Content-Type": "application/octet-stream", "x-vercel-digest": f.sha }, body: f.bytes });
+        onProgress(`uploading ${++done}/${total} new files (vercel has the other ${files.length - total})`);
+      }
+    };
+    await Promise.all(Array.from({ length: 16 }, worker));
+    dep = await create();
+  }
   // For a prebuilt deployment Vercel's BUILDING state only downloads the uploaded files and deploys them.
   const stage = { QUEUED: "queued", INITIALIZING: "queued", BUILDING: "deploying the uploaded output, no build" };
   while (!["READY", "ERROR", "CANCELED"].includes(dep.readyState)) {
