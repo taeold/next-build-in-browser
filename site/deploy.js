@@ -105,7 +105,7 @@ export async function deployPrebuilt(output, onProgress) {
     const events = await api(`/v3/deployments/${dep.id}/events?builds=1&limit=-1`, { token });
     log = (Array.isArray(events) ? events : []).map((e) => (e.payload && e.payload.text) || e.text || "").filter((t) => /deployment files|prebuilt build artifacts|Deploying outputs|Deployment completed/.test(t));
   } catch {}
-  // Production aliases (project.vercel.app) are public; the per-deployment URL can sit behind Deployment Protection.
-  const alias = (dep.alias || []).find((a) => a.endsWith(".vercel.app") || a.endsWith(".tmp.now")) || dep.alias?.[0];
+  // The temporary *.tmp.now alias is public; *.vercel.app aliases of an anonymous deployment sit behind Vercel login.
+  const alias = (dep.alias || []).find((a) => a.endsWith(".tmp.now")) || (dep.alias || []).find((a) => a.endsWith(".vercel.app")) || dep.alias?.[0];
   return { url: "https://" + (alias || dep.url), deploymentUrl: "https://" + dep.url, inspectorUrl: dep.inspectorUrl, claimUrl, expiresAt, deploymentId: dep.id, log };
 }
