@@ -6,6 +6,11 @@ import { createBinding } from "./binding.js";
 import { createRuntime } from "./node/runtime.js";
 import { getDefaultContext } from "/pkg/emnapi-runtime.mjs";
 
+// SWC's standalone wasm build compiles ES modules to CommonJS for require(): on this thread, and for worker threads
+// through threads.js. Pinned, from jsDelivr's npm mirror.
+const SWC = "https://cdn.jsdelivr.net/npm/@swc/wasm-web@1.16.22/wasm.js";
+const swcReady = import(SWC).then(async (swc) => { await swc.default(); return swc; });
+
 const t0 = performance.now();
 const sec = () => ((performance.now() - t0) / 1000).toFixed(2) + "s";
 const post = (type, text) => self.postMessage({ type, text });
@@ -29,6 +34,7 @@ self.onmessage = async ({ data }) => {
   }
   if (data.type !== "run") return;
   const { fsClient, threadCount, exports } = await started;
+  const swc = await swcReady;
 
   let stdoutBuf = "";
   const write = (fd, s) => {
@@ -37,13 +43,13 @@ self.onmessage = async ({ data }) => {
     while ((i = stdoutBuf.indexOf("\n")) >= 0) { post("out", stdoutBuf.slice(0, i).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")); stdoutBuf = stdoutBuf.slice(i + 1); }
   };
   const redirects = { lightningcss: "lightningcss-wasm", "@tailwindcss/oxide": "/polyfills/node_modules/@vv/tailwind-oxide-js/index.js" };
-  // require() of an ES module (Node 22+), compiled to CommonJS by the SWC already in the binding.
-  // "swc" interop honors __esModule, so a default import of another compiled ES module gets its default export.
-  const transformEsm = (source, filename) => exports.transformSync(source, false, globalThis.Buffer.from(JSON.stringify({
+  // require() of an ES module (Node 22+), compiled to CommonJS. "swc" interop honors __esModule, so a default import
+  // of another compiled ES module gets its default export.
+  const transformEsm = (source, filename) => swc.transformSync(source, {
     filename, isModule: true, sourceMaps: false,
     jsc: { parser: { syntax: "ecmascript", importAttributes: true }, target: "es2022" },
     module: { type: "commonjs", importInterop: "swc" },
-  }))).code;
+  }).code;
   const spawnWorker = createThreadHost({ fsClient, setup: { cwd: data.appDir, polyfills: data.polyfills, redirects }, write, transformEsm });
   const rt = createRuntime({
     fs: fsClient, cwd: data.appDir, polyfills: data.polyfills, write,
