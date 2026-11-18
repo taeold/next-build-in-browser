@@ -64,18 +64,17 @@ async function api(path, { token, ...init } = {}) {
 const sha1 = async (bytes) => [...new Uint8Array(await crypto.subtle.digest("SHA-1", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 export async function deployPrebuilt(output, onProgress) {
-  onProgress("creating a temporary vercel project");
+  onProgress("creating project");
   const { token, projectId: project, claimUrl, expiresAt } = await api("/v1/anonymous/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 
   // Like the Vercel CLI: describe every file by hash, and upload only the ones Vercel says it doesn't have yet.
   // Next.js's server runtime is the same in every deployment, so usually only the app's own files are new.
-  onProgress("hashing the output");
   const files = await Promise.all([...output].map(async ([path, [bytes, mode]]) => ({ file: ".vercel/output/" + path, sha: await sha1(bytes), size: bytes.length, mode, bytes })));
   const create = () => api("/v13/deployments?skipAutoDetectionConfirmation=1&prebuilt=1", {
     token, method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: project, project, target: "production", version: 2, files: files.map(({ bytes, ...f }) => f), projectSettings: { framework: null, sourceFilesOutsideRootDirectory: true } }),
   });
-  onProgress("creating the deployment (prebuilt, vercel runs no build)");
+  onProgress("deploying");
   let dep;
   try {
     dep = await create();
@@ -88,16 +87,14 @@ export async function deployPrebuilt(output, onProgress) {
     const worker = async () => {
       for (let f; (f = queue.shift()); ) {
         await api("/v2/files", { token, method: "POST", headers: { "Content-Type": "application/octet-stream", "x-vercel-digest": f.sha }, body: f.bytes });
-        onProgress(`uploading ${++done}/${total} new files (vercel has the other ${files.length - total})`);
+        onProgress(`uploading ${++done}/${total} files`);
       }
     };
     await Promise.all(Array.from({ length: 16 }, worker));
     dep = await create();
   }
-  // For a prebuilt deployment Vercel's BUILDING state only downloads the uploaded files and deploys them.
-  const stage = { QUEUED: "queued", INITIALIZING: "queued", BUILDING: "deploying the uploaded output, no build" };
   while (!["READY", "ERROR", "CANCELED"].includes(dep.readyState)) {
-    onProgress(`vercel: ${stage[dep.readyState] || dep.readyState.toLowerCase()}`);
+    onProgress("deploying");
     await new Promise((r) => setTimeout(r, 2000));
     dep = await api(`/v13/deployments/${dep.id}`, { token });
   }
