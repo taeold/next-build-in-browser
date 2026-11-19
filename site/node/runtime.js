@@ -14,12 +14,14 @@ let nextThreadId = 0;
 // Shared by every runtime in this realm, so the host recognizes an exit thrown from any of them.
 class ProcessExit extends Error { constructor(code) { super(`process.exit(${code})`); this.code = code; } }
 // `redirects` maps a package name to another specifier or an absolute path (for stand-ins of native packages).
-// `transformEsm(source, filename)` compiles an ES module to CommonJS, so require() of ESM works as in Node 22+.
+// `toCommonJs(source, filename, esm)` compiles an ES module to CommonJS, so require() of ESM works as in Node 22+,
+// with import.meta as __vv_meta; in any module, import() becomes __vv_import().
 import { WASI as WasmUtilWASI } from "/wasm-util.js";
 
 // `spawnWorker(init, transfer)` starts a real thread (a Web Worker running node-worker.js) for worker_threads.Worker and
 // returns the MessagePort linked to it.
-export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worker = null, redirects = {}, transformEsm = null, spawnWorker = null }) {
+export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worker = null, redirects = {}, toCommonJs = null, spawnWorker = null, onExit = () => {} }) {
+  let exited = false;
   const builtins = new Map();
   const factories = {};
   // What would keep a Node process alive, shared by every runtime on this thread (they share globals): referenced
@@ -61,7 +63,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     const EE = loadBuiltin("events");
     const p = Object.assign(new EE(), {
       env, argv, execArgv: [], execPath: "/usr/bin/node", argv0: "node", title: "node", pid: 1, ppid: 0,
-      platform: "linux", arch: "x64", version: "v24.0.0", versions: { node: "24.0.0", v8: "13.0", uv: "1.0", modules: "137" },
+      platform: "linux", arch: "x64", version: "v24.22.2", versions: { node: "24.22.2", v8: "13.0", uv: "1.0", modules: "137" },
       release: { name: "node" }, config: { variables: {} }, features: {}, exitCode: undefined, connected: false,
       cwd: () => cwd, chdir: (d) => { cwd = normalize(d.startsWith("/") ? d : join(cwd, d)); },
       umask: () => 0o22, getuid: () => 0, getgid: () => 0, geteuid: () => 0, uptime: () => performance.now() / 1000,
@@ -74,8 +76,10 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       cpuUsage: () => ({ user: 0, system: 0 }), resourceUsage: () => ({}),
       nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
       emitWarning: (w) => write(2, `(warning) ${w && w.message ? w.message : w}\n`),
-      binding: () => ({}), _getActiveHandles: () => [], _getActiveRequests: () => [],
-      exit: (code) => { p.exitCode = code ?? p.exitCode ?? 0; p.emit("exit", p.exitCode); throw new ProcessExit(p.exitCode); },
+      // Old internal bindings some packages still read (Emscripten's NODEFS reads constants.fs).
+      binding: (name) => (name === "constants" ? { fs: loadBuiltin("constants"), os: { signals: {}, errno: {} } } : {}), _getActiveHandles: () => [], _getActiveRequests: () => [],
+      // The exit is reported (onExit) before the throw that unwinds the caller, which app code can catch.
+      exit: (code) => { if (!exited) { exited = true; p.exitCode = code ?? p.exitCode ?? 0; p.emit("exit", p.exitCode); onExit(p.exitCode); } throw new ProcessExit(p.exitCode); },
       kill: () => true, abort: () => { throw new Error("process.abort()"); },
       setUncaughtExceptionCaptureCallback() {}, hasUncaughtExceptionCaptureCallback: () => false,
     });
@@ -90,6 +94,11 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
   }
 
   // ---------- module loader ----------
+  // A package's stand-in (redirects: { lightningcss: "lightningcss-wasm" }), for require() and import() alike.
+  const redirect = (request) => {
+    for (const [from, to] of Object.entries(redirects)) if (request === from || request.startsWith(from + "/")) return to + request.slice(from.length);
+    return request;
+  };
   class Module {
     constructor(id = "", parent) { this.id = id; this.filename = id; this.exports = {}; this.loaded = false; this.children = []; this.parent = parent; this.paths = Module._nodeModulePaths(dirname(id || cwd)); }
     require(id) { return Module._load(id, this, false); }
@@ -101,7 +110,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     }
     static _resolveFilename(request, parent) { return resolve(request, parent ? dirname(parent.filename || join(cwd, "x")) : cwd, parent); }
     static _load(request, parent) {
-      for (const [from, to] of Object.entries(redirects)) if (request === from || request.startsWith(from + "/")) { request = to + request.slice(from.length); break; }
+      request = redirect(request);
       if (isBuiltin(request)) return loadBuiltin(request);
       const filename = Module._resolveFilename(request, parent, false);
       if (isBuiltin(filename)) return loadBuiltin(filename);
@@ -124,6 +133,8 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     }
     static isBuiltin(id) { return isBuiltin(id); }
   }
+  // In Node these are plain enumerable properties, so `import * as m from "node:module"` copies them.
+  for (const k of ["createRequire", "isBuiltin", "_nodeModulePaths", "_resolveFilename", "_load"]) Object.defineProperty(Module, k, { enumerable: true });
   Module._cache = Object.create(null);
   Module._extensions = {
     ".js": (m, filename) => m._compile(readText(filename), filename),
@@ -160,26 +171,27 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     if (isFile(f)) { try { pkg = JSON.parse(readText(f)); } catch { pkg = null; } }
     pkgCache.set(dir, pkg); return pkg;
   };
-  const CONDITIONS = ["node", "require", "default"];
-  function resolveExportsTarget(target, subpathRest) {
+  // Export conditions, as Node picks them: "import" for an ES module's imports, "require" for require().
+  const CONDITIONS = { require: ["node", "require", "default"], import: ["node", "import", "default"] };
+  function resolveExportsTarget(target, subpathRest, conds) {
     if (typeof target === "string") return target.replace(/\*/g, subpathRest);
-    if (Array.isArray(target)) { for (const t of target) { const r = resolveExportsTarget(t, subpathRest); if (r) return r; } return null; }
+    if (Array.isArray(target)) { for (const t of target) { const r = resolveExportsTarget(t, subpathRest, conds); if (r) return r; } return null; }
     if (target && typeof target === "object") {
-      for (const [k, v] of Object.entries(target)) if (CONDITIONS.includes(k)) { const r = resolveExportsTarget(v, subpathRest); if (r) return r; }
+      for (const [k, v] of Object.entries(target)) if (conds.includes(k)) { const r = resolveExportsTarget(v, subpathRest, conds); if (r) return r; }
     }
     return null;
   }
-  function resolveExports(pkgDir, exportsField, subpath) {
+  function resolveExports(pkgDir, exportsField, subpath, conds) {
     let map = exportsField;
     // Shorthand exports (a target or condition map, not subpaths) become { ".": ... }. "imports" keys start with "#".
     if (typeof map === "string" || Array.isArray(map) || (map && !Object.keys(map).some((k) => k.startsWith(".") || k.startsWith("#")))) map = { ".": map };
-    if (map[subpath] !== undefined) { const t = resolveExportsTarget(map[subpath], ""); return t ? join(pkgDir, t) : null; }
+    if (map[subpath] !== undefined) { const t = resolveExportsTarget(map[subpath], "", conds); return t ? join(pkgDir, t) : null; }
     for (const key of Object.keys(map)) {
       const star = key.indexOf("*");
       if (star < 0) continue;
       const pre = key.slice(0, star), post = key.slice(star + 1);
       if (subpath.startsWith(pre) && subpath.endsWith(post) && subpath.length >= key.length - 1) {
-        const t = resolveExportsTarget(map[key], subpath.slice(pre.length, subpath.length - post.length));
+        const t = resolveExportsTarget(map[key], subpath.slice(pre.length, subpath.length - post.length), conds);
         return t ? join(pkgDir, t) : null;
       }
     }
@@ -208,7 +220,8 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     return idx && underPolyfills(p) ? browserMap(p, idx) : idx;
   }
   function tryIndex(p) { for (const e of [".js", ".json", ".cjs"]) if (isFile(join(p, "index" + e))) return join(p, "index" + e); return null; }
-  function resolve(request, basedir, parent) {
+  function resolve(request, basedir, parent, esm = Boolean(parent && parent.esm)) {
+    const conds = esm ? CONDITIONS.import : CONDITIONS.require;
     if (request.startsWith("file:")) request = decodeURIComponent(new URL(request).pathname);
     if (request.startsWith("/") || request.startsWith("./") || request.startsWith("../") || request === "." || request === "..") {
       const p = request.startsWith("/") ? normalize(request) : join(basedir, request);
@@ -221,7 +234,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       let d = basedir;
       for (;;) {
         const pkg = readPkg(d);
-        if (pkg && pkg.imports) { const t = resolveExports(d, pkg.imports, request); if (t && isFile(t)) return t; if (t) { const bare = resolve(t.slice(d.length + 1), d, parent); return bare; } }
+        if (pkg && pkg.imports) { const t = resolveExports(d, pkg.imports, request, conds); if (t && isFile(t)) return t; if (t) { const bare = resolve(t.slice(d.length + 1), d, parent, esm); return bare; } }
         if (pkg || d === "/") break; d = dirname(d);
       }
       throw notFound(request, parent);
@@ -231,7 +244,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       if (pkg && pkg.browser && typeof pkg.browser === "object" && request in pkg.browser) {
         const to = pkg.browser[request];
         if (to === false) return join(polyfills, "../empty.js");
-        if (typeof to === "string") return to.startsWith(".") ? resolve(to, pd, parent) : resolve(to, basedir, parent);
+        if (typeof to === "string") return to.startsWith(".") ? resolve(to, pd, parent, esm) : resolve(to, basedir, parent, esm);
       }
     }
     const parts = request.split("/");
@@ -242,7 +255,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       if (!isDir(pkgDir)) continue;
       const pkg = readPkg(pkgDir);
       if (pkg && pkg.exports !== undefined) {
-        const t = resolveExports(pkgDir, pkg.exports, subpath);
+        const t = resolveExports(pkgDir, pkg.exports, subpath, conds);
         if (t) { const f = tryFile(t); if (f) return f; }
       }
       const p = join(pkgDir, subpath);
@@ -252,13 +265,29 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     throw notFound(request, parent);
   }
 
-  // An ES module with no imports of its own (emnapi's bundles, say) loads natively, so it needs no compiler.
+  // An ES module with no imports of its own (emnapi's bundles, say), no import() and no import.meta loads natively,
+  // so it needs no compiler.
   // Cached per file, so stateful modules load once.
   const nativeModules = new Map();
-  const selfContained = (src) => !/^[ \t]*(import[ \t]*[\w{*"']|export[ \t]*(\*|\{[^}]*\})[ \t]*from\b)/m.test(src);
+  const selfContained = (src) => !/^[ \t]*(import[ \t]*[\w{*"']|export[ \t]*(\*|\{[^}]*\})[ \t]*from\b)/m.test(src) && !/\bimport\s*(\(|\.\s*meta)/.test(src);
+  // A built-in's module namespace: its exports by name, including ones a spread skips (a class's static methods,
+  // such as Module.createRequire), plus default.
+  const namespace = (ex) => {
+    const ns = { default: ex };
+    for (let o = ex; o && o !== Object.prototype && o !== Function.prototype; o = Object.getPrototypeOf(o)) {
+      for (const k of Object.getOwnPropertyNames(o)) if (!(k in ns) && !["prototype", "length", "name", "caller", "arguments", "constructor"].includes(k)) ns[k] = ex[k];
+    }
+    return ns;
+  };
+  // Loading keeps the process alive, as in Node, until the module has evaluated.
   async function dynamicImport(spec, fromFile) {
-    if (isBuiltin(spec)) { const ex = loadBuiltin(spec); return { ...ex, default: ex }; }
-    const filename = resolve(spec, dirname(fromFile), null);
+    const token = {};
+    hold(token);
+    try { return await importModule(redirect(spec), fromFile); } finally { release(token); }
+  }
+  async function importModule(spec, fromFile) {
+    if (isBuiltin(spec)) return namespace(loadBuiltin(spec));
+    const filename = resolve(spec, dirname(fromFile), null, true);
     if (isEsmFile(filename) && !Module._cache[filename]) {
       if (!nativeModules.has(filename)) {
         const src = readText(filename);
@@ -276,31 +305,48 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
   const isEsmFile = (f) => f.endsWith(".mjs") || (f.endsWith(".js") && isEsmPackage(f));
   function compileModule(m, content, filename) {
     if (content.startsWith("#!")) content = "//" + content.slice(2);
-    // SWC's CommonJS transform also rewrites import.meta (dirname, filename, resolve). Its import.meta.url reads
-    // __filename, which an ES module may declare itself, so that one reads __vv_url instead.
-    const esm = Boolean(transformEsm && isEsmFile(filename));
-    // Bun's import.meta.require has no CommonJS form in SWC; packages only reach it under Bun, so it maps to require.
-    if (esm) content = transformEsm(content, filename).replaceAll('require("url").pathToFileURL(__filename).toString()', "__vv_url").replaceAll("import.meta.require(", "require(");
-    const src = content.replace(/(^|[^.\w$])import\(/g, "$1__vv_import(");
+    const esm = Boolean(toCommonJs && isEsmFile(filename));
+    const src = toCommonJs ? toCommonJs(content, filename, esm) : content;
     // An ES module with top-level await runs in an async wrapper; import() waits for it (m.evaluated). Node refuses
     // require() of such modules, so nothing synchronous depends on them finishing.
     // An ES module runs one scope deeper, so its own __dirname or __filename shadows the wrapper's instead of
     // colliding with it.
     const compile = (prefix) => (0, eval)(esm
-      ? `(function (exports, require, module, __filename, __dirname, __vv_import, __vv_url) { return (${prefix}function () {${src}\n})(); })\n//# sourceURL=file://${filename}`
+      ? `(function (exports, require, module, __filename, __dirname, __vv_import, __vv_meta) { return (${prefix}function () {${src}\n})(); })\n//# sourceURL=file://${filename}`
       : `(${prefix}function (exports, require, module, __filename, __dirname, __vv_import) {${src}\n})\n//# sourceURL=file://${filename}`);
     let wrapper, isAsync = false;
     try {
       try { wrapper = compile(""); }
       catch (e) {
-        if (!(e instanceof SyntaxError && /await is only valid/.test(e.message))) throw e;
-        wrapper = compile("async ");
+        // A top-level await outside an async function reads as "await is only valid..." or, before an identifier
+        // (`await __vv_import(...)`), as an unexpected identifier. Only an ES module may have one.
+        if (!(esm && e instanceof SyntaxError && /\bawait\b/.test(src))) throw e;
+        try { wrapper = compile("async "); } catch { throw e; }
         isAsync = true;
       }
     } catch (e) { throw e instanceof SyntaxError ? new SyntaxError(`${e.message} (in ${filename})`) : e; }
+    // Its imports, now require() calls, resolve with "import" conditions; createRequire() still gets "require".
+    m.esm = esm;
     const req = makeRequire(m);
     m.require = (id) => Module._load(id, m, false);
-    const result = wrapper.call(m.exports, m.exports, req, m, filename, dirname(filename), (s) => dynamicImport(String(s), filename), "file://" + encodeURI(filename));
+    // import.meta, as toCommonJs leaves it. Bun's import.meta.require is there too: packages only reach it under Bun.
+    const meta = esm && {
+      url: "file://" + encodeURI(filename), filename, dirname: dirname(filename), require: req,
+      resolve: (spec) => { spec = String(spec); if (isBuiltin(spec) || /^\w+:/.test(spec)) return spec; return "file://" + encodeURI(resolve(spec, dirname(filename), null, true)); },
+    };
+    const run = () => wrapper.call(m.exports, m.exports, req, m, filename, dirname(filename), (s) => dynamicImport(String(s), filename), meta);
+    // As in Node's ES module graph, a module runs once its imports have evaluated, including any still awaiting at
+    // top level. Its imports load first, in order; one that fails here fails again, with its real error, in the body.
+    const pending = [];
+    if (esm) for (const [, id] of src.matchAll(/(?<![\w$.])require\("([^"]+)"\)/g)) {
+      try {
+        req(id);
+        const dep = isBuiltin(redirect(id)) ? null : Module._cache[Module._resolveFilename(redirect(id), m)];
+        if (dep && dep.evaluated) pending.push(dep.evaluated);
+      } catch {}
+    }
+    if (pending.length) return (m.evaluated = Promise.all(pending).then(run));
+    const result = run();
     if (isAsync) m.evaluated = result;
     return result;
   }
@@ -341,7 +387,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       u.types = Object.assign({}, u.types || {}, { isPromise: (v) => v instanceof Promise, isRegExp: (v) => v instanceof RegExp, isDate: (v) => v instanceof Date, isNativeError: (v) => v instanceof Error, isAnyArrayBuffer: (v) => v instanceof ArrayBuffer || v instanceof SharedArrayBuffer, isUint8Array: (v) => v instanceof Uint8Array, isProxy: () => false, isAsyncFunction: (f) => f && f.constructor && f.constructor.name === "AsyncFunction", isGeneratorFunction: (f) => f && f.constructor && /GeneratorFunction/.test(f.constructor.name) });
       u.TextEncoder = TextEncoder; u.TextDecoder = TextDecoder;
       u.stripVTControlCharacters = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
-      u.styleText = (_f, s) => s; u.parseArgs = undefined; u.getSystemErrorName = (c) => String(c); u.isDeepStrictEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+      u.styleText = (_f, s) => s; u.formatWithOptions = (_opts, ...args) => u.format(...args); u.getSystemErrorName = (c) => String(c); u.isDeepStrictEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
       // Like Node, an Error inspects as its stack, followed by its cause and an AggregateError's errors.
       const inspect = u.inspect || ((v) => String(v));
       const inspectError = (e, depth = 0) => {
@@ -354,19 +400,38 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       u.inspect = Object.assign((v, ...rest) => (v instanceof Error ? inspectError(v) : inspect(v, ...rest)), inspect);
       if (!u.inspect.custom) u.inspect.custom = Symbol.for("nodejs.util.inspect.custom");
       u.debuglog = () => Object.assign(() => {}, { enabled: false });
+      // Node's own parseArgs, published as @pkgjs/parseargs. Loaded on first use.
+      Object.defineProperty(u, "parseArgs", { configurable: true, enumerable: true, get: () => poly("@pkgjs/parseargs").parseArgs });
       return u;
     },
     "util/types": () => loadBuiltin("util").types,
     path: () => { const p = poly("path-browserify"); p.posix = p; p.win32 = p; p.toNamespacedPath = (x) => x; return p; },
     "path/posix": () => loadBuiltin("path"), "path/win32": () => loadBuiltin("path"),
-    stream: () => { const s = poly("stream-browserify"); const rs = poly("readable-stream"); s.promises = { pipeline: (...a) => new Promise((res, rej) => rs.pipeline(...a, (e) => (e ? rej(e) : res()))), finished: (st) => new Promise((res, rej) => rs.finished(st, (e) => (e ? rej(e) : res()))) }; s.finished = rs.finished; s.pipeline = rs.pipeline; s.addAbortSignal = (_s, st) => st; s.Readable.fromWeb = s.Readable.fromWeb || (() => { throw new Error("Readable.fromWeb unsupported"); }); return s; },
+    stream: () => { const s = poly("stream-browserify"); const rs = poly("readable-stream"); s.promises = { pipeline: (...a) => new Promise((res, rej) => rs.pipeline(...a, (e) => (e ? rej(e) : res()))), finished: (st) => new Promise((res, rej) => rs.finished(st, (e) => (e ? rej(e) : res()))) }; s.finished = rs.finished; s.pipeline = rs.pipeline; s.addAbortSignal = (_s, st) => st; s.Readable.fromWeb = s.Readable.fromWeb || (() => { throw new Error("Readable.fromWeb unsupported"); });
+      // The polyfill's browser build has no Readable.from. As in Node, a string or buffer is one chunk.
+      s.Readable.from = (source, opts) => {
+        if (typeof source === "string" || source instanceof Uint8Array) source = [source];
+        const it = source[Symbol.asyncIterator] ? source[Symbol.asyncIterator]() : source[Symbol.iterator]();
+        let reading = false;
+        return new s.Readable({
+          objectMode: true, ...opts,
+          async read() {
+            if (reading) return;
+            reading = true;
+            try { for (;;) { const { value, done } = await it.next(); if (done) { this.push(null); break; } if (!this.push(value)) break; } }
+            catch (e) { this.destroy(e); }
+            reading = false;
+          },
+        });
+      };
+      return s; },
     "stream/promises": () => loadBuiltin("stream").promises,
     "stream/web": () => ({ ReadableStream, WritableStream, TransformStream, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream, ByteLengthQueuingStrategy, CountQueuingStrategy }),
     string_decoder: () => poly("string_decoder"),
     querystring: () => poly("querystring-es3"),
     punycode: () => poly("punycode"),
     assert: () => { const a = poly("assert"); a.strict = a; return a; },
-    zlib: () => { const z = poly("browserify-zlib"); z.constants = z.constants || {}; z.brotliCompressSync = (b) => b; z.brotliDecompressSync = (b) => b; z.createBrotliCompress = () => { throw new Error("brotli unsupported"); }; return z; },
+    zlib: () => { const z = poly("browserify-zlib"); z.constants = z.constants || {}; z.brotliCompressSync = (b) => b; z.brotliDecompressSync = (b) => b; z.createBrotliCompress = () => { throw new Error("brotli unsupported"); }; const noBrotli = (_b, _o, cb) => (cb || _o)(new Error("brotli unsupported")); z.brotliCompress = noBrotli; z.brotliDecompress = noBrotli; z.createBrotliDecompress = z.createBrotliCompress; return z; },
     url: () => {
       const u = poly("url");
       u.URL = URL; u.URLSearchParams = URLSearchParams;
@@ -380,8 +445,14 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       return Object.assign({}, o, { platform: () => "linux", type: () => "Linux", arch: () => "x64", release: () => "6.0.0", tmpdir: () => "/tmp", homedir: () => env.HOME || "/home/user", hostname: () => "browser", EOL: "\n", cpus: () => Array.from({ length: 2 }, () => ({ model: "browser", speed: 0, times: {} })), availableParallelism: () => 2, totalmem: () => 4 << 30, freemem: () => 2 << 30, endianness: () => "LE", userInfo: () => ({ username: "user", uid: 0, gid: 0, shell: "/bin/sh", homedir: env.HOME || "/home/user" }), networkInterfaces: () => ({}), loadavg: () => [0, 0, 0], uptime: () => 0, constants: { signals: {}, errno: {} }, devNull: "/dev/null", machine: () => "x86_64", version: () => "browser" });
     },
     crypto: () => {
-      const createHash = poly("create-hash"), createHmac = poly("create-hmac"), randomBytes = poly("randombytes");
       const Buffer = loadBuiltin("buffer").Buffer;
+      // The polyfills' digest() predates base64url.
+      const withBase64url = (make) => (...args) => {
+        const h = make(...args), digest = h.digest.bind(h);
+        h.digest = (enc) => (enc === "base64url" ? digest().toString("base64url") : digest(enc));
+        return h;
+      };
+      const createHash = withBase64url(poly("create-hash")), createHmac = withBase64url(poly("create-hmac")), randomBytes = poly("randombytes");
       return {
         createHash, createHmac, randomBytes, webcrypto: crypto, subtle: crypto.subtle,
         randomUUID: () => crypto.randomUUID(), getRandomValues: (a) => crypto.getRandomValues(a),
@@ -415,11 +486,26 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     readline: () => ({ createInterface: () => ({ on() { return this; }, close() {}, question(_q, cb) { cb(""); } }), emitKeypressEvents() {}, clearLine() {}, cursorTo() {}, moveCursor() {} }),
     worker_threads: () => makeWorkerThreads(),
     child_process: () => makeChildProcess(),
-    http: () => ({ STATUS_CODES: {}, METHODS: ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], createServer: () => { throw new Error("http.createServer is not available in the browser build host"); }, Agent: class { constructor() {} }, globalAgent: {}, request: () => { throw new Error("http.request is not available"); }, get: () => { throw new Error("http.get is not available"); }, IncomingMessage: class {}, ServerResponse: class {}, Server: class {}, OutgoingMessage: class {}, validateHeaderName() {}, validateHeaderValue() {} }),
+    http: () => makeHttp(),
     https: () => loadBuiltin("http"), http2: () => ({ constants: {}, connect: () => { throw new Error("http2 is not available"); } }),
     net: () => ({ isIP: (s) => (/^\d+\.\d+\.\d+\.\d+$/.test(s) ? 4 : s.includes(":") ? 6 : 0), isIPv4: (s) => /^\d+\.\d+\.\d+\.\d+$/.test(s), isIPv6: (s) => s.includes(":"), Socket: class {}, createServer: () => { throw new Error("net.createServer is not available"); }, connect: () => { throw new Error("net.connect is not available"); } }),
     tls: () => ({ connect: () => { throw new Error("tls is not available"); } }),
-    dns: () => ({ lookup: (_h, _o, cb) => (cb || _o)(new Error("dns unavailable")), promises: { lookup: async () => { throw new Error("dns unavailable"); } } }),
+    // The tab has no resolver: localhost and IP literals answer as on a machine with no network, anything else is
+    // ENOTFOUND. Build tools only look up localhost (Vite, for its dev server's address).
+    dns: () => {
+      const answer = (host, opts) => {
+        const family = (h) => (/^\d+\.\d+\.\d+\.\d+$/.test(h) ? 4 : h.includes(":") ? 6 : 0);
+        const list = host === "localhost" ? [{ address: "127.0.0.1", family: 4 }] : family(host) ? [{ address: host, family: family(host) }] : null;
+        if (!list) throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: "ENOTFOUND", hostname: host });
+        return opts && opts.all ? list : list[0];
+      };
+      const lookup = (host, opts, cb) => {
+        if (typeof opts === "function") { cb = opts; opts = {}; }
+        let r; try { r = answer(host, opts); } catch (e) { return queueMicrotask(() => cb(e)); }
+        queueMicrotask(() => (Array.isArray(r) ? cb(null, r) : cb(null, r.address, r.family)));
+      };
+      return { lookup, promises: { lookup: async (host, opts) => answer(host, opts) } };
+    },
     "dns/promises": () => loadBuiltin("dns").promises,
     inspector: () => ({ url: () => undefined, open() {}, close() {}, Session: class { connect() {} post() {} disconnect() {} } }),
     // Node's WASI class on @tybys/wasm-util, over this runtime's file system.
@@ -436,34 +522,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     }),
   });
 
-  // A real thread has no compiler, so this thread compiles every ES module the thread will load, found by following
-  // string-literal require() calls from its entry (after compilation, imports are require() calls too). Cached per
-  // entry: each wasm thread of a binding starts from the same entry.
-  const threadGraphs = new Map();
-  function compileThreadGraph(entry) {
-    if (!transformEsm) return {};
-    if (threadGraphs.has(entry)) return threadGraphs.get(entry);
-    const transformed = {}, seen = new Set(), todo = [entry];
-    while (todo.length) {
-      const file = todo.pop();
-      if (seen.has(file) || !/\.[cm]?js$/.test(file)) continue;
-      seen.add(file);
-      let code = readText(file);
-      if (isEsmFile(file)) transformed[file] = code = transformEsm(code, file);
-      // Also renamed requires: SWC turns a module's own `const require = createRequire(...)` into require1.
-      for (const [, , spec] of code.matchAll(/require\w*\(\s*(["'])([^"'\n]+)\1\s*\)/g)) {
-        let request = spec;
-        for (const [from, to] of Object.entries(redirects)) if (request === from || request.startsWith(from + "/")) { request = to + request.slice(from.length); break; }
-        if (isBuiltin(request)) continue;
-        try { const target = resolve(request, dirname(file), null); if (!isBuiltin(target)) todo.push(target); } catch {}
-      }
-    }
-    threadGraphs.set(entry, transformed);
-    return transformed;
-  }
-
-  // A Worker is a real thread (spawnWorker) with its own runtime. This thread compiles the ES modules it will load
-  // (compileThreadGraph), since the compiler lives here.
+  // A Worker is a real thread (spawnWorker) with its own runtime.
   function makeWorkerThreads() {
     const EE = loadBuiltin("events");
     const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
@@ -474,7 +533,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
         this.threadId = ++nextThreadId;
         const filename = String(file).startsWith("file:") ? decodeURIComponent(new URL(String(file)).pathname) : String(file);
         const thread = spawnWorker({
-          filename, transformed: compileThreadGraph(filename), threadId: this.threadId,
+          filename, threadId: this.threadId,
           env: opts.env && opts.env !== SHARE_ENV ? { ...opts.env } : { ...loadBuiltin("process").env },
           argv: [argv[0], filename, ...(opts.argv || []).map(String)],
           workerData: opts.workerData === undefined ? null : opts.workerData,
@@ -519,6 +578,85 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     };
   }
 
+  // http with loopback only: servers listen inside this thread, and fetch() of http://localhost:<port> (or
+  // 127.0.0.1) reaches them, as a build tool's own local server (Astro's fonts, a prerender) would on one machine.
+  // There is no other network.
+  function makeHttp() {
+    const EE = loadBuiltin("events"), { Readable, Writable } = loadBuiltin("stream"), { Buffer } = loadBuiltin("buffer");
+    const servers = loop.servers || (loop.servers = new Map());
+    const unavailable = (name) => () => { throw new Error(`http.${name} is not available in the browser build host`); };
+    class IncomingMessage extends Readable {
+      constructor({ method = "GET", url = "/", headers = {}, body = null } = {}) {
+        super(); this.method = method; this.url = url; this.headers = headers; this.httpVersion = "1.1";
+        this.socket = this.connection = { remoteAddress: "127.0.0.1", encrypted: false };
+        this._body = body;
+      }
+      _read() { if (this._body) this.push(Buffer.from(this._body)); this._body = null; this.push(null); }
+    }
+    class ServerResponse extends Writable {
+      constructor(req) { super(); this.req = req; this.statusCode = 200; this.statusMessage = ""; this._headers = {}; this.headersSent = false; this._chunks = []; this.on("finish", () => this.emit("close")); }
+      setHeader(k, v) { this._headers[String(k).toLowerCase()] = v; return this; }
+      getHeader(k) { return this._headers[String(k).toLowerCase()]; }
+      getHeaders() { return { ...this._headers }; }
+      getHeaderNames() { return Object.keys(this._headers); }
+      hasHeader(k) { return String(k).toLowerCase() in this._headers; }
+      removeHeader(k) { delete this._headers[String(k).toLowerCase()]; }
+      writeHead(code, msg, headers) {
+        if (typeof msg !== "string") headers = msg; else this.statusMessage = msg;
+        this.statusCode = code;
+        for (const [k, v] of Array.isArray(headers) ? [] : Object.entries(headers || {})) this.setHeader(k, v);
+        this.headersSent = true; return this;
+      }
+      flushHeaders() { this.headersSent = true; }
+      _write(chunk, enc, cb) { this.headersSent = true; this._chunks.push(Buffer.from(chunk, enc)); cb(); }
+    }
+    class Server extends EE {
+      constructor(opts, handler) { super(); if (typeof opts === "function") handler = opts; if (handler) this.on("request", handler); this.listening = false; }
+      listen(...args) {
+        const cb = args.find((a) => typeof a === "function");
+        let port = typeof args[0] === "object" && args[0] ? args[0].port : args[0];
+        port = Number(port) || 0;
+        if (!port) do port = 40000 + Math.floor(Math.random() * 20000); while (servers.has(port));
+        if (servers.has(port)) { queueMicrotask(() => this.emit("error", Object.assign(new Error(`listen EADDRINUSE: address already in use :::${port}`), { code: "EADDRINUSE" }))); return this; }
+        servers.set(port, this); this._port = port; this.listening = true; hold(this);
+        if (cb) this.once("listening", cb);
+        queueMicrotask(() => this.emit("listening"));
+        return this;
+      }
+      address() { return this.listening ? { address: "127.0.0.1", family: "IPv4", port: this._port } : null; }
+      close(cb) {
+        if (this.listening) { servers.delete(this._port); this.listening = false; release(this); }
+        queueMicrotask(() => { this.emit("close"); if (cb) cb(); });
+        return this;
+      }
+      ref() { if (this.listening) hold(this); return this; }
+      unref() { release(this); return this; }
+      closeAllConnections() {} closeIdleConnections() {} setTimeout() { return this; }
+    }
+    // A request to a loopback server: the handler's response as a fetch Response.
+    const dispatch = (server, { method, url, headers, body }) => new Promise((resolve, reject) => {
+      const req = new IncomingMessage({ method, url, headers, body });
+      const res = new ServerResponse(req);
+      res.on("finish", () => {
+        const h = new Headers();
+        for (const [k, v] of Object.entries(res._headers)) for (const one of [].concat(v)) h.append(k, String(one));
+        const noBody = method === "HEAD" || [204, 304].includes(res.statusCode);
+        resolve(new Response(noBody ? null : Buffer.concat(res._chunks), { status: res.statusCode, statusText: res.statusMessage, headers: h }));
+      });
+      res.on("error", reject);
+      try { server.emit("request", req, res); } catch (e) { reject(e); }
+    });
+    loop.loopback = (url) => { const u = new URL(url); return u.protocol === "http:" && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(u.hostname) ? servers.get(Number(u.port || 80)) : null; };
+    loop.dispatch = dispatch;
+    return {
+      STATUS_CODES: { 200: "OK", 204: "No Content", 301: "Moved Permanently", 302: "Found", 304: "Not Modified", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error" },
+      METHODS: ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+      createServer: (opts, handler) => new Server(opts, handler),
+      Server, IncomingMessage, ServerResponse, OutgoingMessage: Writable,
+      Agent: class { constructor() {} }, globalAgent: {}, request: unavailable("request"), get: unavailable("get"),
+      validateHeaderName() {}, validateHeaderValue() {}, maxHeaderSize: 16384,
+    };
+  }
   function makeAsyncHooks() {
     // One render at a time: the store set by run() stays current for the async work it starts until run() is
     // entered again. Enough for the compile path, which does not prerender.
@@ -563,6 +701,13 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     const statOrUndef = (fn, p, o) => { try { return fn(abs(p), o); } catch (e) { if (o && o.throwIfNoEntry === false && e.code === "ENOENT") return undefined; throw e; } };
     const mkdirp = (p) => { const parts = p.split("/").filter(Boolean); let cur = ""; for (const part of parts) { cur += "/" + part; try { fsc.mkdirSync(cur); } catch (e) { if (e.code !== "EEXIST") throw e; } } };
     const rmrf = (p) => { let st; try { st = fsc.lstatSync(p); } catch (e) { if (e.code === "ENOENT") return; throw e; } if (st.isDirectory()) { for (const n of fsc.readdirSync(p)) rmrf(join(p, n)); fsc.rmdirSync(p); } else fsc.unlinkSync(p); };
+    // stdin, stdout and stderr: an empty stdin and the build's output, as character devices.
+    const STDIO = (fd) => fd === 0 || fd === 1 || fd === 2;
+    const ttyStat = () => {
+      const t = new Date(0);
+      return { dev: 0, ino: 0, mode: 0o20620, nlink: 1, uid: 0, gid: 0, rdev: 0, size: 0, blksize: 4096, blocks: 0, atimeMs: 0, mtimeMs: 0, ctimeMs: 0, birthtimeMs: 0, atime: t, mtime: t, ctime: t, birthtime: t,
+        isFile: () => false, isDirectory: () => false, isSymbolicLink: () => false, isBlockDevice: () => false, isCharacterDevice: () => true, isSocket: () => false, isFIFO: () => false };
+    };
     const s = {
       existsSync: (p) => { try { fsc.statSync(abs(p)); return true; } catch { return false; } },
       readFileSync: wrap("open", (p, o) => { const b = Buffer.from(readBytes(typeof p === "number" ? (() => { throw Object.assign(new Error("fd read"), { code: "EBADF" }); })() : abs(p))); const e = enc(o); return e ? b.toString(e) : b; }),
@@ -570,7 +715,7 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       appendFileSync: wrap("open", (p, d, o) => { let prev = new Uint8Array(0); try { prev = readBytes(abs(p)); } catch {} fsc.writeFileBytes(abs(p), Buffer.concat([Buffer.from(prev), Buffer.from(toBytes(d, enc(o)))])); }),
       statSync: wrap("stat", (p, o) => statOrUndef(fsc.statSync, p, o)),
       lstatSync: wrap("lstat", (p, o) => statOrUndef(fsc.lstatSync, p, o)),
-      fstatSync: wrap("fstat", (fd, o) => fsc.fstatSync(fd, o)),
+      fstatSync: wrap("fstat", (fd, o) => (STDIO(fd) ? ttyStat() : fsc.fstatSync(fd, o))),
       readdirSync: wrap("scandir", (p, o) => {
         const dir = abs(p), types = !!(o && o.withFileTypes), recursive = !!(o && o.recursive);
         const list = [];
@@ -600,9 +745,10 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
       readlinkSync: wrap("readlink", (p) => fsc.readlinkSync(abs(p))),
       accessSync: wrap("access", (p) => { fsc.statSync(abs(p)); }),
       openSync: wrap("open", (p, f = "r") => fsc.openSync(abs(p), f)),
-      closeSync: (fd) => fsc.closeSync(fd),
-      readSync: (fd, b, off, len, pos) => (typeof off === "object" && off ? fsc.readSync(fd, b, off.offset || 0, off.length ?? b.length, off.position ?? null) : fsc.readSync(fd, b, off, len, pos)),
-      writeSync: (fd, d, off, len, pos) => { if (typeof d === "string") { const b = Buffer.from(d); return fsc.writeSync(fd, b, 0, b.length, typeof off === "number" ? off : null); } return fsc.writeSync(fd, d, off ?? 0, len ?? d.length - (off ?? 0), pos ?? null); },
+      closeSync: (fd) => (STDIO(fd) ? undefined : fsc.closeSync(fd)),
+      readSync: (fd, b, off, len, pos) => (fd === 0 ? 0 : typeof off === "object" && off ? fsc.readSync(fd, b, off.offset || 0, off.length ?? b.length, off.position ?? null) : fsc.readSync(fd, b, off, len, pos)),
+      writeSync: (fd, d, off, len, pos) => {
+        if (fd === 1 || fd === 2) { const b = typeof d === "string" ? d : Buffer.from(d.buffer, d.byteOffset + (off ?? 0), len ?? d.length - (off ?? 0)).toString(); write(fd, b); return typeof d === "string" ? Buffer.byteLength(d) : len ?? d.length - (off ?? 0); } if (typeof d === "string") { const b = Buffer.from(d); return fsc.writeSync(fd, b, 0, b.length, typeof off === "number" ? off : null); } return fsc.writeSync(fd, d, off ?? 0, len ?? d.length - (off ?? 0), pos ?? null); },
       ftruncateSync: (fd, l) => fsc.ftruncateSync(fd, l), fsyncSync() {}, fdatasyncSync() {},
       utimesSync: (p, a, m) => fsc.utimesSync(abs(p), +a / 1000 || 0, +m / 1000 || 0),
       symlinkSync: wrap("symlink", (t, p) => fsc.symlinkSync(t, abs(p))),
@@ -637,6 +783,19 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
   // ---------- globals for loaded code ----------
   const installGlobals = () => {
     const { Buffer } = loadBuiltin("buffer");
+    // fetch() of a loopback server (see makeHttp) is answered in this thread.
+    if (!globalThis.__vvFetch) {
+      const real = globalThis.fetch.bind(globalThis);
+      globalThis.__vvFetch = true;
+      globalThis.fetch = async (input, init) => {
+        const request = new Request(input, init);
+        const server = loop.loopback && loop.loopback(request.url);
+        if (!server) return real(input, init);
+        const u = new URL(request.url);
+        const body = ["GET", "HEAD"].includes(request.method) ? null : new Uint8Array(await request.arrayBuffer());
+        return loop.dispatch(server, { method: request.method, url: u.pathname + u.search, headers: Object.fromEntries(request.headers), body });
+      };
+    }
     globalThis.Buffer = Buffer; globalThis.process = loadBuiltin("process"); globalThis.global = globalThis;
     // Node's TextDecoder accepts views over SharedArrayBuffer (N-API buffers point into shared wasm memory);
     // browsers throw, so copy those first.

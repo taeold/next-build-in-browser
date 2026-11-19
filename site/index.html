@@ -2,7 +2,7 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>next build, in your browser</title>
+<title>npmrunbuild</title>
 <link rel="icon" href="data:,">
 <link rel="preload" href="/assets/fonts/GeistMono-Regular.woff2" as="font" type="font/woff2" crossorigin>
 <style>
@@ -37,18 +37,18 @@
   #actions select:focus-visible { outline: 1px dotted var(--dim); outline-offset: 3px; }
 </style>
 <main>
-  <h1>next build, in your browser.</h1>
-  <p class="lead">Drop a Next.js app. Install deps, build, and deploy right in the browser.</p>
+  <h1>npmrunbuild</h1>
+  <p class="lead">Drop and build your app. Maybe.</p>
   <p id="mobile" class="bad" hidden>Phones may run out of memory and crash the tab.</p>
 
   <div id="term">
-    <div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="title">next build</span><span></span></div>
+    <div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="title">npm run build</span><span></span></div>
     <div id="screen"></div>
     <div id="actions"></div>
   </div>
   <input id="folder" type="file" webkitdirectory hidden>
 
-  <p class="dim">Turbopack and SWC run as WebAssembly. No build server. <a href="https://github.com/taeold/next-build-in-browser">source</a></p>
+  <p class="dim">Runs in your browser. No build server. <a href="https://github.com/taeold/next-build-in-browser">source</a></p>
 </main>
 <script type="module" src="/app.js"></script>
 </html>

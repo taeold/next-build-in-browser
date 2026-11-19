@@ -224,28 +224,48 @@ function mountPack(bytes) {
   return header.files.length;
 }
 
+// Packs mount at the paths in their headers; each of `files` ([url, path]) becomes one file. All download at once.
+async function load({ packs = [], files: fileList = [] }) {
+  const progress = new Map();
+  const report = (url) => (seen, total) => {
+    progress.set(url, [seen, total]);
+    let s = 0, t = 0; for (const [a, b] of progress.values()) { s += a; t += b; }
+    self.postMessage({ type: "progress", seen: s, total: t });
+  };
+  const [packBytes, singles] = await Promise.all([
+    Promise.all(packs.map((url) => fetchBytes(url, report(url)))),
+    Promise.all(fileList.map(([url]) => fetchBytes(url, report(url)))),
+  ]);
+  let files = 0;
+  for (const bytes of packBytes) files += mountPack(bytes);
+  fileList.forEach(([, path], i) => { addFile(norm(path), singles[i], 0o644, Date.now()); files++; });
+  return files;
+}
+// Every file under dir as [path relative to `base`, bytes, link target]. Symlinks stay symlinks: Turbopack links
+// server externals as .next/node_modules/<pkg>-<hash> -> ../../node_modules/<pkg>.
+function readTree(dir, base, out = []) {
+  for (const name of [...nodes.get(dir).children].sort()) {
+    const p = dir + "/" + name, n = nodes.get(p);
+    if (n.kind === "link") out.push([p.slice(base.length + 1), new TextEncoder().encode(n.target), n.target]);
+    else if (n.kind === "dir") readTree(p, base, out);
+    else out.push([p.slice(base.length + 1), n.data.slice(0, n.size)]);
+  }
+  return out;
+}
+
 self.onmessage = async ({ data }) => {
-  if (data.type === "init") {
-    // Packs mount at the paths in their headers; each of `files` ([url, path]) becomes one file. All download at once.
-    const progress = new Map();
-    const report = (url) => (seen, total) => {
-      progress.set(url, [seen, total]);
-      let s = 0, t = 0; for (const [a, b] of progress.values()) { s += a; t += b; }
-      self.postMessage({ type: "progress", seen: s, total: t });
-    };
-    const fileList = data.files || [];
-    const [packs, singles] = await Promise.all([
-      Promise.all(data.packs.map((url) => fetchBytes(url, report(url)))),
-      Promise.all(fileList.map(([url]) => fetchBytes(url, report(url)))),
-    ]);
-    let files = 0;
-    for (const bytes of packs) files += mountPack(bytes);
-    fileList.forEach(([, path], i) => { addFile(norm(path), singles[i], 0o644, Date.now()); files++; });
+  if (data.type === "load") {
+    const files = await load(data);
     for (const d of data.extraDirs || []) addDir(d);
-    self.postMessage({ type: "ready", files });
+    self.postMessage({ type: "loaded", id: data.id, files });
   } else if (data.type === "writeFiles") {
     for (const [p, bytes] of data.files) addFile(norm(p), bytes);
     self.postMessage({ type: "written", count: data.files.length });
+  } else if (data.type === "readTree") {
+    // The first of `dirs` that exists (and holds `marker`, if given) under `base`.
+    const found = data.dirs.find(([d, marker]) => nodes.get(norm(data.base + "/" + d))?.kind === "dir" && (!marker || nodes.has(norm(`${data.base}/${d}/${marker}`))));
+    const files = found ? readTree(norm(data.base + "/" + found[0]), norm(data.base)) : [];
+    self.postMessage({ type: "tree", dir: found && found[0], files }, files.map(([, b]) => b.buffer));
   } else if (data.type === "registrar") {
     listenRegistrar(data.port);
   }

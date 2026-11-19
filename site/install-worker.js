@@ -19,8 +19,9 @@ self.onmessage = async ({ data }) => {
   try {
     const pkg = JSON.parse(data.packageJson);
     const plan = data.lockJson ? fromLockfile(JSON.parse(data.lockJson)) : await resolveTree(pkg);
-    await addWasmBuilds(plan);
+    await addCompanions(plan);
     const result = await install(plan);
+    linkBins();
     self.postMessage({ type: "done", ok: true, ...result, seconds: (performance.now() - t0) / 1000, fromLockfile: !!data.lockJson });
   } catch (e) {
     self.postMessage({ type: "done", ok: false, error: String(e && (e.message || e)) });
@@ -40,14 +41,21 @@ const platformOk = (p) => fits(p.os, PLATFORM.os) && fits(p.cpu, PLATFORM.cpu);
 function readJson(path) { try { return JSON.parse(new TextDecoder().decode(fs.readFileBytes(path))); } catch { return null; } }
 function existingTopLevel() {
   const out = new Map();
-  const names = [];
-  for (const n of fs.readdirSync(`${APP}/node_modules`)) {
+  for (const name of topLevel()) { const p = readJson(`${APP}/node_modules/${name}/package.json`); if (p && p.version) out.set(name, p.version); }
+  return out;
+}
+
+// Package names directly in /app/node_modules ("a", "@scope/b"). None before the first install of a non-Next.js app.
+function topLevel() {
+  const dir = `${APP}/node_modules`, names = [];
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch { return names; }
+  for (const n of entries) {
     if (n.startsWith(".")) continue;
-    if (n.startsWith("@")) for (const m of fs.readdirSync(`${APP}/node_modules/${n}`)) names.push(`${n}/${m}`);
+    if (n.startsWith("@")) for (const m of fs.readdirSync(`${dir}/${n}`)) names.push(`${n}/${m}`);
     else names.push(n);
   }
-  for (const name of names) { const p = readJson(`${APP}/node_modules/${name}/package.json`); if (p && p.version) out.set(name, p.version); }
-  return out;
+  return names;
 }
 
 // ---------- lockfile (npm v2/v3) ----------
@@ -84,10 +92,11 @@ async function pick(name, range) {
   return doc.versions[v];
 }
 
-async function resolveTree(rootPkg) {
+// `base` is a plan already made: what it installs counts as present.
+async function resolveTree(rootPkg, base = new Map()) {
   const plan = new Map();
   const present = existingTopLevel(); // name -> version already in /app/node_modules
-  const versionAt = (loc) => (plan.has(loc) ? plan.get(loc).version : loc.split("/").length === 2 ? present.get(loc.slice("node_modules/".length)) : undefined);
+  const versionAt = (loc) => (plan.has(loc) ? plan.get(loc).version : base.has(loc) ? base.get(loc).version : loc.split("/").length === 2 ? present.get(loc.slice("node_modules/".length)) : undefined);
   const queue = [];
   const want = (deps, from, kind) => { for (const [name, range] of Object.entries(deps || {})) if (!PROVIDED(name)) queue.push({ name, range, from, kind }); };
   want(rootPkg.dependencies, "", "dep");
@@ -128,20 +137,22 @@ async function resolveTree(rootPkg) {
   return plan;
 }
 
-// Native packages with an official wasm build get it installed next to them; the runtime redirects to it.
-const WASM_BUILDS = { lightningcss: "lightningcss-wasm" };
-async function addWasmBuilds(plan) {
-  for (const p of [...plan.values()]) {
-    const wasm = WASM_BUILDS[p.name];
-    if (!wasm || plan.has("node_modules/" + wasm)) continue;
-    const meta = await pick(wasm, p.version);
-    plan.set("node_modules/" + wasm, { name: wasm, version: meta.version, tarball: meta.dist.tarball, integrity: meta.dist.integrity, optional: false });
-    for (const [dep, range] of Object.entries(meta.dependencies || {})) {
-      if (plan.has("node_modules/" + dep)) continue;
-      const d = await pick(dep, range);
-      plan.set("node_modules/" + dep, { name: dep, version: d.version, tarball: d.dist.tarball, integrity: d.dist.integrity, optional: false });
-    }
+// Packages installed next to another: a native package's official wasm build, at the same version (the runtime
+// redirects to it), and the adapter SvelteKit's adapter-auto would install with npm at build time for the host it
+// detects (Vercel: builds run with VERCEL=1).
+const COMPANIONS = {
+  lightningcss: (version) => ["lightningcss-wasm", version],
+  rollup: (version) => ["@rollup/wasm-node", version],
+  "@sveltejs/adapter-auto": () => ["@sveltejs/adapter-vercel", "*"],
+};
+async function addCompanions(plan) {
+  const extra = {};
+  for (const p of plan.values()) {
+    const companion = COMPANIONS[p.name] && COMPANIONS[p.name](p.version);
+    if (companion && !plan.has("node_modules/" + companion[0])) extra[companion[0]] = companion[1];
   }
+  if (!Object.keys(extra).length) return;
+  for (const [location, p] of await resolveTree({ dependencies: extra }, plan)) if (!plan.has(location)) plan.set(location, p);
 }
 
 // ---------- download, verify, unpack ----------
@@ -215,6 +226,21 @@ async function install(plan) {
   };
   await Promise.all(Array.from({ length: 6 }, worker));
   return { added: done, skipped, megabytes: bytes / 1048576 };
+}
+// node_modules/.bin/<name> links to each top-level package's "bin" entries, as npm makes them.
+function linkBins() {
+  const dir = `${APP}/node_modules`;
+  mkdirp(`${dir}/.bin`);
+  for (const name of topLevel()) {
+    const pkg = readJson(`${dir}/${name}/package.json`);
+    if (!pkg || !pkg.bin) continue;
+    const bins = typeof pkg.bin === "string" ? { [pkg.name.split("/").pop()]: pkg.bin } : pkg.bin;
+    for (const [bin, target] of Object.entries(bins)) {
+      const link = `${dir}/.bin/${bin}`;
+      try { fs.unlinkSync(link); } catch {}
+      fs.symlinkSync(`../${name}/${target.replace(/^\.\//, "")}`, link);
+    }
+  }
 }
 function mkdirp(dir) {
   let cur = "";

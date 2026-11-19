@@ -13,8 +13,18 @@ const handle = app.getRequestHandler();
 module.exports = async (req, res) => { await ready; return handle(req, res); };
 `;
 
-export function toBuildOutput(framework, files, appFiles, proof) {
-  return framework.output === "static" ? staticOutput(framework.outDir, files, proof) : nextOutput(files, appFiles, proof);
+// kind and dir come from the page's OUTPUTS table.
+export function toBuildOutput(kind, dir, files, appFiles, proof) {
+  if (kind === "vercel") return vercelOutput(dir, files, proof);
+  return kind === "static" ? staticOutput(dir, files, proof) : nextOutput(files, appFiles, proof);
+}
+
+// Build Output API v3 the framework's own Vercel adapter wrote (.vercel/output), uploaded as it is.
+function vercelOutput(dir, files, proof) {
+  const out = new Map();
+  for (const [p, bytes, link] of files) out.set(p.slice(dir.length + 1), [bytes, link ? 0o120777 : 0o100644]);
+  out.set("static/built-in-browser.json", [new TextEncoder().encode(JSON.stringify(proof, null, 2)), 0o100644]);
+  return out;
 }
 
 // Build Output API v3 for a static site: the output directory as static files, served as they are.

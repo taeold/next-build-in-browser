@@ -56,7 +56,7 @@ echo "== Node.js polyfills"
 mkdir -p "$WORK/polyfills" "$WORK/extra"
 (cd "$WORK/polyfills" && echo '{"private":true}' > package.json && npm install --no-audit --no-fund --loglevel=error \
   path-browserify events buffer util stream-browserify readable-stream@3 string_decoder url querystring-es3 \
-  assert browserify-zlib os-browserify create-hash create-hmac randombytes punycode)
+  assert browserify-zlib os-browserify create-hash create-hmac randombytes punycode @pkgjs/parseargs)
 echo "module.exports = {};" > "$WORK/extra/empty.js"
 
 echo "== trim"
@@ -66,8 +66,10 @@ for d in "$WORK/app/node_modules" "$WORK/polyfills/node_modules"; do
 done
 
 echo "== archive"
-node "$ROOT/scripts/pack.mjs" "$SITE/assets/base.pack.br" \
-  "$WORK/app/node_modules=/app/node_modules" "$WORK/polyfills/node_modules=/polyfills/node_modules" "$WORK/extra=/polyfills"
+# Every app gets the Node.js polyfills; only Next.js apps download Next.js.
+rm -f "$SITE/assets/base.pack.br"
+node "$ROOT/scripts/pack.mjs" "$SITE/assets/node.pack.br" "$WORK/polyfills/node_modules=/polyfills/node_modules" "$WORK/extra=/polyfills"
+node "$ROOT/scripts/pack.mjs" "$SITE/assets/next.pack.br" "$WORK/app/node_modules=/app/node_modules"
 
 echo "== wasm-util, semver, brotli decoder, fonts"
 mkdir -p "$WORK/tools" "$SITE/assets/fonts"

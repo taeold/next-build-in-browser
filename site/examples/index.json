@@ -1,45 +1,74 @@
 {
-  "commit": "62b2306eaf8a968f79d6faba815398447d41bb29",
   "examples": [
     {
       "name": "blog-starter",
+      "framework": "Next.js",
       "description": "App Router blog: Markdown, Tailwind, next/font/google",
+      "where": "vercel/next.js/examples/blog-starter",
       "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/blog-starter"
     },
     {
-      "name": "radix-ui",
-      "description": "App Router, Radix UI, Tailwind CSS 3",
-      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/radix-ui"
-    },
-    {
-      "name": "with-framer-motion",
-      "description": "Pages Router, Framer Motion page transitions",
-      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/with-framer-motion"
-    },
-    {
       "name": "image-component",
+      "framework": "Next.js",
       "description": "App Router, next/image",
+      "where": "vercel/next.js/examples/image-component",
       "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/image-component"
     },
     {
       "name": "api-routes-apollo-server-and-client",
+      "framework": "Next.js",
       "description": "Pages Router, GraphQL API route with Apollo",
+      "where": "vercel/next.js/examples/api-routes-apollo-server-and-client",
       "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/api-routes-apollo-server-and-client"
     },
     {
-      "name": "with-styled-components",
-      "description": "App Router, styled-components",
-      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/with-styled-components"
-    },
-    {
-      "name": "with-sass",
-      "description": "App Router, Sass",
-      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/with-sass"
-    },
-    {
       "name": "with-redux",
+      "framework": "Next.js",
       "description": "App Router, Redux Toolkit",
+      "where": "vercel/next.js/examples/with-redux",
       "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/with-redux"
+    },
+    {
+      "name": "astro-blog",
+      "framework": "Astro",
+      "description": "Markdown, MDX, optimized images, sitemap",
+      "where": "withastro/astro/examples/blog",
+      "source": "https://github.com/withastro/astro/tree/6fb274ee5026f00df2b140a5acb3d1aacfab68af/examples/blog"
+    },
+    {
+      "name": "astro-portfolio",
+      "framework": "Astro",
+      "description": "Static portfolio site",
+      "where": "withastro/astro/examples/portfolio",
+      "source": "https://github.com/withastro/astro/tree/6fb274ee5026f00df2b140a5acb3d1aacfab68af/examples/portfolio"
+    },
+    {
+      "name": "sveltekit-demo",
+      "framework": "SvelteKit",
+      "description": "The sv create demo: Sverdle, server routes",
+      "where": "sveltejs/cli/packages/sv/src/create/templates/demo",
+      "source": "https://github.com/sveltejs/cli/tree/92b0d37fd24be0544f1dfc066306cd4758daa8c7/packages/sv/src/create/templates/demo"
+    },
+    {
+      "name": "vite-react",
+      "framework": "Vite",
+      "description": "React + TypeScript",
+      "where": "vitejs/vite/packages/create-vite/template-react-ts",
+      "source": "https://github.com/vitejs/vite/tree/ef295d54d56478437112acd7deeb9821d755b90f/packages/create-vite/template-react-ts"
+    },
+    {
+      "name": "vite-vue",
+      "framework": "Vite",
+      "description": "Vue + TypeScript, vue-tsc",
+      "where": "vitejs/vite/packages/create-vite/template-vue-ts",
+      "source": "https://github.com/vitejs/vite/tree/ef295d54d56478437112acd7deeb9821d755b90f/packages/create-vite/template-vue-ts"
+    },
+    {
+      "name": "vite-svelte",
+      "framework": "Vite",
+      "description": "Svelte + TypeScript",
+      "where": "vitejs/vite/packages/create-vite/template-svelte-ts",
+      "source": "https://github.com/vitejs/vite/tree/ef295d54d56478437112acd7deeb9821d755b90f/packages/create-vite/template-svelte-ts"
     }
   ]
 }
