@@ -34,7 +34,7 @@ self.onmessage = async ({ data }) => {
     let i;
     while ((i = stdoutBuf.indexOf("\n")) >= 0) { post("out", stdoutBuf.slice(0, i).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")); stdoutBuf = stdoutBuf.slice(i + 1); }
   };
-  const redirects = { lightningcss: "lightningcss-wasm", "@tailwindcss/oxide": "/polyfills/node_modules/@vv/tailwind-oxide-js/index.js" };
+  const redirects = { lightningcss: "lightningcss-wasm" };
   // require() of an ES module (Node 22+), compiled to CommonJS. "swc" interop honors __esModule, so a default import
   // of another compiled ES module gets its default export.
   const transformEsm = (source, filename) => swc.transformSync(source, {
@@ -45,7 +45,7 @@ self.onmessage = async ({ data }) => {
   const spawnWorker = createThreadHost({ fsClient, setup: { cwd: data.appDir, polyfills: data.polyfills, redirects }, write, transformEsm });
   const rt = createRuntime({
     fs: fsClient, cwd: data.appDir, polyfills: data.polyfills, write,
-    // Native packages Tailwind needs: lightningcss has an official wasm build; oxide gets a JS scanner (see the file).
+    // lightningcss publishes its WebAssembly build as a separate package, lightningcss-wasm.
     redirects,
     // worker_threads get real threads (node-worker.js, created by threads.js).
     spawnWorker,

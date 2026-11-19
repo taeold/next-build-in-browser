@@ -154,11 +154,10 @@ async function build(files, label, title) {
     app = { files, name, framework };
     print(`<span class="faint">${esc(label)}:</span> ${esc(name)} <span class="faint">(${files.length} files)</span>`);
     await fsReady;
-    const scanner = new Uint8Array(await (await fetch("/node/tailwind-oxide-js.cjs")).arrayBuffer());
     await new Promise((resolve) => {
       const done = (e) => { if (e.data.type === "written") { fsWorker.removeEventListener("message", done); resolve(); } };
       fsWorker.addEventListener("message", done);
-      fsWorker.postMessage({ type: "writeFiles", files: [...files.map(([p, b]) => ["/app/" + p, b]), ["/polyfills/node_modules/@vv/tailwind-oxide-js/index.js", scanner]] });
+      fsWorker.postMessage({ type: "writeFiles", files: files.map(([p, b]) => ["/app/" + p, b]) });
     });
     await npmInstall(files);
     await hostReady;
