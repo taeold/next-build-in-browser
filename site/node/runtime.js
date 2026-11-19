@@ -404,7 +404,9 @@ export function createRuntime({ fs: fsc, env, argv, cwd, polyfills, write, worke
     async_hooks: () => makeAsyncHooks(),
     diagnostics_channel: () => { const ch = () => ({ hasSubscribers: false, publish() {}, subscribe() {}, unsubscribe() {}, bindStore() {}, runStores: (_d, fn, t, ...a) => fn.apply(t, a) }); return { channel: ch, hasSubscribers: () => false, subscribe() {}, unsubscribe() {}, tracingChannel: () => ({ start: ch(), end: ch(), asyncStart: ch(), asyncEnd: ch(), error: ch(), hasSubscribers: false, traceSync: (fn, _c, t, ...a) => fn.apply(t, a), tracePromise: (fn, _c, t, ...a) => fn.apply(t, a), traceCallback: (fn, _p, _c, t, ...a) => fn.apply(t, a) }) }; },
     vm: () => {
-      const runInContext = (code, ctx) => { const keys = Object.keys(ctx || {}); return Function(...keys, `return eval(${JSON.stringify(String(code))})`)(...keys.map((k) => ctx[k])); };
+      // In a new context the contextified object is the global: `globalThis`, `this` and free variables resolve
+      // against it (manifests write globalThis.__RSC_MANIFEST into it), with this realm's built-ins behind it.
+      const runInContext = (code, ctx = {}) => Function("globalThis", "__vv_ctx", `with (__vv_ctx) { return eval(${JSON.stringify(String(code))}); }`).call(ctx, ctx, ctx);
       class Script { constructor(code) { this.code = code; } runInThisContext() { return (0, eval)(this.code); } runInNewContext(ctx) { return runInContext(this.code, ctx); } runInContext(ctx) { return runInContext(this.code, ctx); } createCachedData() { return new Uint8Array(0); } }
       return { Script, runInThisContext: (c) => (0, eval)(c), runInNewContext: runInContext, runInContext, createContext: (c = {}) => c, isContext: () => true, compileFunction: (code, params = []) => Function(...params, code), constants: {} };
     },
