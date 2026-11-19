@@ -8,6 +8,7 @@ import { execFileSync } from "node:child_process";
 
 const COMMIT = "62b2306eaf8a968f79d6faba815398447d41bb29";
 const EXAMPLES = [
+  ["blog-starter", "App Router blog: Markdown, Tailwind, next/font/google"],
   ["radix-ui", "App Router, Radix UI, Tailwind CSS 3"],
   ["with-framer-motion", "Pages Router, Framer Motion page transitions"],
   ["image-component", "App Router, next/image"],

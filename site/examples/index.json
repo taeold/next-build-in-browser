@@ -2,6 +2,11 @@
   "commit": "62b2306eaf8a968f79d6faba815398447d41bb29",
   "examples": [
     {
+      "name": "blog-starter",
+      "description": "App Router blog: Markdown, Tailwind, next/font/google",
+      "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/blog-starter"
+    },
+    {
       "name": "radix-ui",
       "description": "App Router, Radix UI, Tailwind CSS 3",
       "source": "https://github.com/vercel/next.js/tree/62b2306eaf8a968f79d6faba815398447d41bb29/examples/radix-ui"

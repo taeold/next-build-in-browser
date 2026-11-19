@@ -41,7 +41,7 @@ const again = ["build another app", () => { location.href = location.pathname; }
 // ---------- boot ----------
 // The two big toolchain files come from jsDelivr, out of the repo's `assets` branch at a pinned commit
 // (scripts/publish-assets.sh), so the page's own host serves only small files. A local server uses its copies.
-const ASSETS = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? "/assets" : "https://cdn.jsdelivr.net/gh/taeold/next-build-in-browser@43874e83f18f1d7a9246462eb45073f91c6f223d";
+const ASSETS = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? "/assets" : "https://cdn.jsdelivr.net/gh/taeold/next-build-in-browser@5ecce2262d05817d2d47f795c3450fdf05e69d2d";
 const toolchain = print("toolchain: loading", "faint");
 const fsWorker = new Worker("/fs-worker.js", { type: "module", name: "fs" });
 const fsReady = new Promise((resolve) => fsWorker.addEventListener("message", (e) => {
